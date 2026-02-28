@@ -1,18 +1,16 @@
-const FIXED_KEY = 'd14bd0e0-9ade-4824-aa96-03bbe680b4db'; // 保持不变
+const FIXED_KEY = 'd14bd0e0-9ade-4824-aa96-03bbe680b4db';
 let mainServer = 'yx1.9898981.xyz:8443';
 
-// 备用服务器列表
+// 备用服务器列表 - 使用可用的服务器
 const BACKUP_SERVERS = [
-    'service1.ca.example.net:443',
-    'service2.hk.example.net:443',
-    'service3.sg.example.net:443',
-    'service4.jp.example.net:443',
-    'service5.us.example.net:443'
+    'proxyip.cf.342688.xyz:443',
+    'proxyip.hk.342688.xyz:443',
+    'proxyip.jp.342688.xyz:443'
 ];
 
 // 超时设置
 const LINK_TIMEOUT = 5000;
-const MAX_RETRY = 3;
+const MAX_RETRY = 2;
 
 export default {
     async fetch(request) {
@@ -36,9 +34,11 @@ export default {
 async function getServerList(request) {
     const servers = [];
     
+    // 解析主服务器
     const [mainHost, mainPort] = await parseAddress(mainServer);
     servers.push({ host: mainHost, port: mainPort });
     
+    // 添加备用服务器
     for (const backup of BACKUP_SERVERS) {
         const [host, port] = await parseAddress(backup);
         servers.push({ host, port });
@@ -73,19 +73,18 @@ async function handleWebSocket(request, config) {
     serverWS.addEventListener('close', stopHeartbeat);
     serverWS.addEventListener('error', stopHeartbeat);
 
-    // 获取early data，但不处理，让数据流自己处理
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
-    console.log('Early data length:', earlyData.length);
-    
     const readableStream = createReadableStream(serverWS, earlyData);
     
     let remoteConn = null;
     let udpWriter = null;
     let isDnsMode = false;
+    let currentTarget = null;
+    let currentData = null;
 
     readableStream.pipeTo(new WritableStream({
         async write(dataChunk) {
-            // 确保数据是Uint8Array
+            // 确保数据格式正确
             let buffer;
             if (dataChunk instanceof ArrayBuffer) {
                 buffer = new Uint8Array(dataChunk);
@@ -97,12 +96,12 @@ async function handleWebSocket(request, config) {
                 buffer = new Uint8Array(dataChunk);
             }
 
-            // DNS mode
+            // DNS模式
             if (isDnsMode && udpWriter) {
                 return udpWriter(buffer);
             }
 
-            // Forward data if connected
+            // 如果已连接，直接转发数据
             if (remoteConn) {
                 try {
                     const writer = remoteConn.writable.getWriter();
@@ -128,10 +127,15 @@ async function handleWebSocket(request, config) {
             }
 
             const responseHeader = new Uint8Array([parseResult.version[0], 0]);
-            
-            // 获取客户端数据（可能是HTTP请求）
             const clientData = buffer.slice(parseResult.dataOffset);
             
+            // 保存目标信息用于重试
+            currentTarget = {
+                host: parseResult.targetAddress,
+                port: parseResult.targetPort
+            };
+            currentData = clientData;
+
             // UDP DNS处理
             if (parseResult.isUdp) {
                 if (parseResult.targetPort === 53) {
@@ -145,7 +149,7 @@ async function handleWebSocket(request, config) {
                 }
             }
 
-            // 带超时的TCP连接
+            // 带超时的TCP连接函数
             async function connectWithTimeout(host, port, timeout = LINK_TIMEOUT) {
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), timeout);
@@ -163,34 +167,111 @@ async function handleWebSocket(request, config) {
                 }
             }
 
-            // 连接到目标服务器
-            try {
-                console.log(`Connecting to ${parseResult.targetAddress}:${parseResult.targetPort}`);
-                remoteConn = await connectWithTimeout(
-                    parseResult.targetAddress,
-                    parseResult.targetPort
-                );
+            // 尝试连接并发送数据
+            async function tryConnect() {
+                try {
+                    console.log(`Connecting to ${currentTarget.host}:${currentTarget.port}`);
+                    remoteConn = await connectWithTimeout(
+                        currentTarget.host,
+                        currentTarget.port
+                    );
 
-                // 发送客户端数据（可能是HTTP请求）
-                const writer = remoteConn.writable.getWriter();
-                await writer.write(clientData);
-                writer.releaseLock();
+                    const writer = remoteConn.writable.getWriter();
+                    await writer.write(currentData);
+                    writer.releaseLock();
 
-                // 开始数据传输
-                transferData(
-                    remoteConn,
-                    serverWS,
-                    responseHeader,
-                    serverList,
-                    parseResult.targetAddress,
-                    parseResult.targetPort,
-                    clientData
-                );
-            } catch (err) {
-                console.log(`Connection failed to ${parseResult.targetAddress}:${parseResult.targetPort}:`, err.message);
-                closeConnection(remoteConn);
-                serverWS.close(1011, 'Connection error');
+                    // 开始数据传输
+                    await transferData(
+                        remoteConn,
+                        serverWS,
+                        responseHeader,
+                        serverList
+                    );
+                } catch (err) {
+                    console.log(`Connection failed:`, err.message);
+                    closeConnection(remoteConn);
+                    remoteConn = null;
+                    
+                    // 尝试重试
+                    await retryConnection(serverWS, responseHeader, 0);
+                }
             }
+
+            // 重试函数
+            async function retryConnection(ws, header, attempt) {
+                if (attempt >= MAX_RETRY || !serverList || serverList.length === 0) {
+                    console.log('All retries failed');
+                    if (ws.readyState === WS_STATE_OPEN) {
+                        ws.close(1011, 'All connections failed');
+                    }
+                    return;
+                }
+
+                // 使用备用服务器
+                const proxyServer = serverList[attempt % serverList.length];
+                console.log(`Retry attempt ${attempt + 1} with proxy ${proxyServer.host}:${proxyServer.port}`);
+
+                try {
+                    // 先连接到代理服务器
+                    const proxyConn = await connectWithTimeout(
+                        proxyServer.host,
+                        proxyServer.port
+                    );
+
+                    // 通过代理连接到目标服务器
+                    const writer = proxyConn.writable.getWriter();
+                    
+                    // 构建CONNECT请求
+                    const connectReq = `CONNECT ${currentTarget.host}:${currentTarget.port} HTTP/1.1\r\nHost: ${currentTarget.host}:${currentTarget.port}\r\n\r\n`;
+                    await writer.write(new TextEncoder().encode(connectReq));
+                    
+                    // 读取响应
+                    const reader = proxyConn.readable.getReader();
+                    let response = '';
+                    
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        
+                        response += new TextDecoder().decode(value);
+                        if (response.includes('\r\n\r\n')) {
+                            break;
+                        }
+                    }
+                    
+                    reader.releaseLock();
+
+                    // 检查连接是否成功
+                    if (response.includes('200 Connection established')) {
+                        console.log('Proxy connection established');
+                        
+                        // 发送实际数据
+                        await writer.write(currentData);
+                        writer.releaseLock();
+
+                        remoteConn = proxyConn;
+
+                        // 开始数据传输
+                        await transferData(
+                            proxyConn,
+                            ws,
+                            header,
+                            serverList
+                        );
+                    } else {
+                        throw new Error('Proxy connection failed');
+                    }
+                } catch (err) {
+                    console.log(`Retry ${attempt + 1} failed:`, err.message);
+                    closeConnection(proxyConn);
+                    
+                    // 继续下一次重试
+                    await retryConnection(ws, header, attempt + 1);
+                }
+            }
+
+            // 开始初始连接
+            await tryConnect();
         },
         close() {
             if (remoteConn) {
@@ -200,9 +281,6 @@ async function handleWebSocket(request, config) {
     })).catch(err => {
         console.log('Stream error:', err.message);
         closeConnection(remoteConn);
-        if (serverWS.readyState === WS_STATE_OPEN) {
-            serverWS.close(1011, 'Internal error');
-        }
     });
 
     return new Response(null, {
@@ -240,24 +318,16 @@ function createReadableStream(ws, earlyData) {
                 controller.error(err);
             });
 
-            // 处理early data - 直接作为二进制数据
+            // 处理early data
             if (earlyData && earlyData.length > 0 && !earlyDataSent) {
                 try {
-                    // 对于Go客户端的early data，它可能已经是base64编码的HTTP请求
-                    // 我们需要先解码base64
-                    let base64Str = earlyData;
-                    // 移除可能的空白字符
-                    base64Str = base64Str.replace(/\s/g, '');
-                    
-                    // 添加padding
+                    // 解码base64
+                    let base64Str = earlyData.replace(/\s/g, '');
                     while (base64Str.length % 4) {
                         base64Str += '=';
                     }
-                    
-                    // 替换URL安全字符
                     base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
                     
-                    // 解码base64
                     const decodedStr = atob(base64Str);
                     const bytes = new Uint8Array(decodedStr.length);
                     for (let i = 0; i < decodedStr.length; i++) {
@@ -269,7 +339,7 @@ function createReadableStream(ws, earlyData) {
                     earlyDataSent = true;
                 } catch (e) {
                     console.log('Early data decode error:', e.message);
-                    // 如果解码失败，尝试直接使用
+                    // 如果解码失败，直接使用
                     const bytes = new Uint8Array(earlyData.length);
                     for (let i = 0; i < earlyData.length; i++) {
                         bytes[i] = earlyData.charCodeAt(i) & 0xFF;
@@ -282,36 +352,31 @@ function createReadableStream(ws, earlyData) {
 }
 
 function parseVLESSHeader(buffer) {
-    if (buffer.byteLength < 18) { // 至少需要18字节来读取关键信息
+    if (buffer.byteLength < 18) {
         return { hasError: true, message: 'Header too short' };
     }
 
     try {
-        // 检查是否是VLESS协议
-        // VLESS协议的第一个字节应该是0
+        // 检查协议版本
         if (buffer[0] !== 0) {
             return { hasError: true, message: 'Invalid protocol version' };
         }
 
-        // 提取UUID (字节1-16)
+        // 提取UUID
         const keyBytes = new Uint8Array(buffer.slice(1, 17));
         const key = formatKey(keyBytes);
 
         // 验证UUID
         if (FIXED_KEY && key !== FIXED_KEY) {
-            console.log('Key mismatch:', key, 'vs', FIXED_KEY);
             return { hasError: true, message: 'Invalid key' };
         }
 
-        // 获取附加选项长度（字节17）
         const optionsLen = buffer[17];
         
-        // 检查缓冲区是否足够
         if (buffer.byteLength < 18 + optionsLen + 3) {
             return { hasError: true, message: 'Incomplete header' };
         }
 
-        // 命令字节
         const cmd = buffer[18 + optionsLen];
         let isUdp = false;
 
@@ -323,7 +388,7 @@ function parseVLESSHeader(buffer) {
 
         let offset = 19 + optionsLen;
         
-        // 端口 (2字节)
+        // 端口
         const port = (buffer[offset] << 8) | buffer[offset + 1];
         offset += 2;
 
@@ -335,7 +400,7 @@ function parseVLESSHeader(buffer) {
         switch (addrType) {
             case 1: // IPv4
                 if (buffer.byteLength < offset + 4) {
-                    return { hasError: true, message: 'Incomplete IPv4 address' };
+                    return { hasError: true, message: 'Incomplete IPv4' };
                 }
                 address = Array.from(buffer.slice(offset, offset + 4)).join('.');
                 addrLen = 4;
@@ -343,11 +408,11 @@ function parseVLESSHeader(buffer) {
                 
             case 2: // Domain
                 if (buffer.byteLength < offset + 1) {
-                    return { hasError: true, message: 'Incomplete domain length' };
+                    return { hasError: true, message: 'Incomplete domain len' };
                 }
                 const domainLen = buffer[offset++];
                 if (buffer.byteLength < offset + domainLen) {
-                    return { hasError: true, message: 'Incomplete domain name' };
+                    return { hasError: true, message: 'Incomplete domain' };
                 }
                 const domainBytes = buffer.slice(offset, offset + domainLen);
                 address = new TextDecoder().decode(domainBytes);
@@ -356,7 +421,7 @@ function parseVLESSHeader(buffer) {
                 
             case 3: // IPv6
                 if (buffer.byteLength < offset + 16) {
-                    return { hasError: true, message: 'Incomplete IPv6 address' };
+                    return { hasError: true, message: 'Incomplete IPv6' };
                 }
                 const ipv6 = [];
                 for (let i = 0; i < 16; i += 2) {
@@ -392,24 +457,17 @@ async function transferData(
     remoteSocket,
     webSocket,
     header,
-    serverList,
-    targetHost,
-    targetPort,
-    initialData,
-    retryCount = 0
+    serverList
 ) {
     const MAX_FRAGMENT = 128 * 1024;
     let headerSent = false;
 
     try {
         const reader = remoteSocket.readable.getReader();
-        let hasData = false;
 
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-
-            hasData = true;
 
             if (webSocket.readyState !== WS_STATE_OPEN) break;
 
@@ -436,39 +494,6 @@ async function transferData(
         }
 
         reader.releaseLock();
-
-        // 如果没有数据收到，尝试重试
-        if (!hasData && retryCount < MAX_RETRY && serverList.length > 1) {
-            const nextIndex = (retryCount + 1) % serverList.length;
-            const nextServer = serverList[nextIndex];
-
-            console.log(`Retry ${nextIndex + 1}: ${nextServer.host}:${nextServer.port}`);
-
-            try {
-                const newSocket = await connect({
-                    hostname: targetHost,
-                    port: targetPort
-                });
-
-                const writer = newSocket.writable.getWriter();
-                await writer.write(initialData);
-                writer.releaseLock();
-
-                await transferData(
-                    newSocket,
-                    webSocket,
-                    header,
-                    serverList,
-                    targetHost,
-                    targetPort,
-                    initialData,
-                    retryCount + 1
-                );
-                return;
-            } catch (err) {
-                console.log('Retry failed:', err.message);
-            }
-        }
 
         if (webSocket.readyState === WS_STATE_OPEN) {
             webSocket.close(1000, 'Done');
@@ -550,12 +575,6 @@ async function parseAddress(serverAddr) {
     serverAddr = serverAddr.toLowerCase();
     let host = serverAddr;
     let port = 443;
-
-    if (serverAddr.includes('.tp')) {
-        const match = serverAddr.match(/\.tp(\d+)/);
-        if (match) port = parseInt(match[1], 10);
-        return [host, port];
-    }
 
     if (serverAddr.includes(']:')) {
         const parts = serverAddr.split(']:');
