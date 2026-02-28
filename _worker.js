@@ -11,7 +11,7 @@ const BACKUP_SERVERS = [
 ];
 
 // 超时设置
-const LINK_TIMEOUT = 3000;
+const LINK_TIMEOUT = 5000; // 增加到5秒
 const MAX_RETRY = 3;
 
 export default {
@@ -72,14 +72,13 @@ async function handleWebSocket(request, config) {
 
     serverWS.addEventListener('close', () => {
         stopHeartbeat();
-        serverWS.close(1000, 'Normal closure');
     });
 
     serverWS.addEventListener('error', () => {
         stopHeartbeat();
-        serverWS.close(1011, 'Internal error');
     });
 
+    // 正确处理early data
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readableStream = createReadableStream(serverWS, earlyData);
     
@@ -89,16 +88,26 @@ async function handleWebSocket(request, config) {
 
     readableStream.pipeTo(new WritableStream({
         async write(dataChunk) {
+            // 确保数据是Uint8Array
+            let buffer;
+            if (dataChunk instanceof ArrayBuffer) {
+                buffer = new Uint8Array(dataChunk);
+            } else if (dataChunk instanceof Uint8Array) {
+                buffer = dataChunk;
+            } else {
+                buffer = new Uint8Array(dataChunk);
+            }
+
             // DNS mode
             if (isDnsMode && udpWriter) {
-                return udpWriter(dataChunk);
+                return udpWriter(buffer);
             }
 
             // Forward data if connected
             if (remoteConn) {
                 try {
                     const writer = remoteConn.writable.getWriter();
-                    await writer.write(dataChunk);
+                    await writer.write(buffer);
                     writer.releaseLock();
                 } catch (err) {
                     closeConnection(remoteConn);
@@ -108,8 +117,11 @@ async function handleWebSocket(request, config) {
             }
 
             // Parse header
-            const parseResult = parseHeader(dataChunk);
-            if (parseResult.hasError) throw new Error(parseResult.message);
+            const parseResult = parseHeader(buffer);
+            if (parseResult.hasError) {
+                console.log('Header parse error:', parseResult.message);
+                throw new Error(parseResult.message);
+            }
             
             // Block specific domain
             if (parseResult.targetAddress.includes(atob('c3BlZWQuY2xvdWRmbGFyZS5jb20='))) {
@@ -117,8 +129,10 @@ async function handleWebSocket(request, config) {
             }
 
             const responseHeader = new Uint8Array([parseResult.version[0], 0]);
-            const clientData = dataChunk.slice(parseResult.dataOffset);
-
+            
+            // 获取客户端数据
+            const clientData = buffer.slice(parseResult.dataOffset);
+            
             // UDP DNS handling
             if (parseResult.isUdp) {
                 if (parseResult.targetPort === 53) {
@@ -152,6 +166,7 @@ async function handleWebSocket(request, config) {
 
             // Connect to target
             try {
+                console.log(`Connecting to ${parseResult.targetAddress}:${parseResult.targetPort}`);
                 remoteConn = await connectWithTimeout(
                     parseResult.targetAddress,
                     parseResult.targetPort
@@ -174,7 +189,7 @@ async function handleWebSocket(request, config) {
             } catch (err) {
                 console.log(`Connection failed to ${parseResult.targetAddress}:${parseResult.targetPort}:`, err.message);
                 closeConnection(remoteConn);
-                serverWS.close(1011, 'Connection error: ' + (err && err.message ? err.message : err));
+                serverWS.close(1011, 'Connection error');
             }
         },
         close() {
@@ -183,9 +198,10 @@ async function handleWebSocket(request, config) {
             }
         }
     })).catch(err => {
+        console.log('Stream error:', err.message);
         closeConnection(remoteConn);
         if (serverWS.readyState === WS_STATE_OPEN) {
-            serverWS.close(1011, 'Internal error: ' + (err && err.message ? err.message : err));
+            serverWS.close(1011, 'Internal error');
         }
     });
 
@@ -200,8 +216,16 @@ function createReadableStream(ws, earlyData) {
         start(controller) {
             ws.addEventListener('message', event => {
                 let data = event.data;
+                // 处理各种可能的格式
                 if (typeof data === 'string') {
                     data = new TextEncoder().encode(data);
+                } else if (data instanceof Blob) {
+                    data.arrayBuffer().then(buf => {
+                        controller.enqueue(new Uint8Array(buf));
+                    }).catch(err => {
+                        console.log('Blob error:', err);
+                    });
+                    return;
                 } else if (data instanceof ArrayBuffer) {
                     data = new Uint8Array(data);
                 }
@@ -216,12 +240,30 @@ function createReadableStream(ws, earlyData) {
                 controller.error(err);
             });
 
+            // 处理early data
             if (earlyData) {
                 try {
-                    const decoded = atob(earlyData.replace(/-/g, '+').replace(/_/g, '/'));
-                    const data = Uint8Array.from(decoded, c => c.charCodeAt(0));
+                    // 移除所有URL安全字符替换，直接处理base64
+                    let base64 = earlyData;
+                    // 处理Go客户端的特殊格式
+                    if (base64.includes(' ')) {
+                        base64 = base64.split(' ')[0];
+                    }
+                    // 添加padding
+                    while (base64.length % 4) {
+                        base64 += '=';
+                    }
+                    
+                    const decoded = atob(base64);
+                    const data = new Uint8Array(decoded.length);
+                    for (let i = 0; i < decoded.length; i++) {
+                        data[i] = decoded.charCodeAt(i);
+                    }
+                    console.log('Early data length:', data.length);
                     controller.enqueue(data);
-                } catch (e) {}
+                } catch (e) {
+                    console.log('Early data decode error:', e.message);
+                }
             }
         }
     });
@@ -229,10 +271,10 @@ function createReadableStream(ws, earlyData) {
 
 function parseHeader(buffer) {
     if (buffer.byteLength < 24) {
-        return { hasError: true, message: 'Invalid header length' };
+        return { hasError: true, message: 'Header too short' };
     }
 
-    const view = new DataView(buffer);
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     const version = new Uint8Array(buffer.slice(0, 1));
     const keyBytes = new Uint8Array(buffer.slice(1, 17));
     const key = formatKey(keyBytes);
@@ -259,22 +301,24 @@ function parseHeader(buffer) {
     let address = '';
 
     switch (addrType) {
-        case 1:
-            address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
+        case 1: // IPv4
+            const ipBytes = new Uint8Array(buffer.slice(offset, offset + 4));
+            address = Array.from(ipBytes).join('.');
             offset += 4;
             break;
-        case 2:
+        case 2: // Domain
             const domainLen = view.getUint8(offset++);
-            address = new TextDecoder().decode(buffer.slice(offset, offset + domainLen));
+            const domainBytes = new Uint8Array(buffer.slice(offset, offset + domainLen));
+            address = new TextDecoder().decode(domainBytes);
             offset += domainLen;
             break;
-        case 3:
+        case 3: // IPv6
             const ipv6 = [];
             for (let i = 0; i < 8; i++) {
-                ipv6.push(view.getUint16(offset).toString(16).padStart(4, '0'));
+                ipv6.push(view.getUint16(offset).toString(16));
                 offset += 2;
             }
-            address = ipv6.join(':').replace(/(^|:)0+(\w)/g, '$1$2');
+            address = ipv6.join(':');
             break;
         default:
             return { hasError: true, message: 'Unsupported address type' };
@@ -302,45 +346,7 @@ async function transferData(
     retryCount = 0
 ) {
     const MAX_FRAGMENT = 128 * 1024;
-    const MAX_BUFFER = 2 * 1024 * 1024;
-    const FLUSH_INTERVAL = 10;
-
     let headerSent = false;
-    let bufferQueue = [];
-    let bufferedSize = 0;
-    let linkLost = false;
-
-    const mergeBuffers = (buffers) => {
-        if (buffers.length === 1) return buffers[0];
-        let total = 0;
-        for (const buf of buffers) total += buf.byteLength;
-        const merged = new Uint8Array(total);
-        let pos = 0;
-        for (const buf of buffers) {
-            merged.set(buf, pos);
-            pos += buf.byteLength;
-        }
-        return merged;
-    };
-
-    const sendFragmented = (data) => {
-        let pos = 0;
-        while (pos < data.byteLength) {
-            const end = Math.min(pos + MAX_FRAGMENT, data.byteLength);
-            webSocket.send(data.slice(pos, end));
-            pos = end;
-        }
-    };
-
-    const flushQueue = () => {
-        if (webSocket.readyState !== WS_STATE_OPEN || bufferQueue.length === 0) return;
-        const merged = mergeBuffers(bufferQueue);
-        bufferQueue = [];
-        bufferedSize = 0;
-        sendFragmented(merged);
-    };
-
-    const flushTimer = setInterval(flushQueue, FLUSH_INTERVAL);
 
     try {
         const reader = remoteSocket.readable.getReader();
@@ -357,27 +363,31 @@ async function transferData(
             if (!headerSent) {
                 const combined = new Uint8Array(header.byteLength + value.byteLength);
                 combined.set(new Uint8Array(header), 0);
-                combined.set(value, header.byteLength);
-                bufferQueue.push(combined);
-                bufferedSize += combined.byteLength;
+                combined.set(new Uint8Array(value), header.byteLength);
+                
+                // 分片发送
+                let pos = 0;
+                while (pos < combined.byteLength) {
+                    const end = Math.min(pos + MAX_FRAGMENT, combined.byteLength);
+                    webSocket.send(combined.slice(pos, end));
+                    pos = end;
+                }
                 headerSent = true;
             } else {
-                bufferQueue.push(value);
-                bufferedSize += value.byteLength;
-            }
-
-            if (bufferedSize >= MAX_BUFFER) {
-                flushQueue();
+                // 直接发送数据
+                let pos = 0;
+                while (pos < value.byteLength) {
+                    const end = Math.min(pos + MAX_FRAGMENT, value.byteLength);
+                    webSocket.send(value.slice(pos, end));
+                    pos = end;
+                }
             }
         }
 
         reader.releaseLock();
-        flushQueue();
-        clearInterval(flushTimer);
 
-        // Retry if no data and we have backup servers
+        // Retry if no data
         if (!hasData && retryCount < MAX_RETRY && serverList.length > 1) {
-            linkLost = true;
             const nextIndex = (retryCount + 1) % serverList.length;
             const nextServer = serverList[nextIndex];
 
@@ -405,23 +415,15 @@ async function transferData(
                 );
             } catch (err) {
                 console.log('Retry failed:', err.message);
-                closeConnection(remoteSocket);
-                if (webSocket.readyState === WS_STATE_OPEN) {
-                    webSocket.close(1011, 'Retry failed');
-                }
             }
-            return;
         }
 
-        if (webSocket.readyState === WS_STATE_OPEN && !linkLost) {
+        if (webSocket.readyState === WS_STATE_OPEN) {
             webSocket.close(1000, 'Done');
         }
     } catch (err) {
-        clearInterval(flushTimer);
+        console.log('Transfer error:', err.message);
         closeConnection(remoteSocket);
-        if (webSocket.readyState === WS_STATE_OPEN) {
-            webSocket.close(1011, 'Transfer error');
-        }
     }
 }
 
@@ -445,7 +447,7 @@ async function handleUDP(webSocket, responseHeader) {
         transform(chunk, controller) {
             for (let idx = 0; idx < chunk.byteLength;) {
                 const lenBuf = chunk.slice(idx, idx + 2);
-                const pktLen = new DataView(lenBuf).getUint16(0);
+                const pktLen = new DataView(lenBuf.buffer, lenBuf.byteOffset, lenBuf.byteLength).getUint16(0);
                 const udpData = new Uint8Array(
                     chunk.slice(idx + 2, idx + 2 + pktLen)
                 );
