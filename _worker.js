@@ -1,5 +1,5 @@
 const FIXED_KEY = 'd14bd0e0-9ade-4824-aa96-03bbe680b4db';
-let mainServer = 'yx1.9898981.xyz:8443';
+let mainServer = 'yx1.98981.xyz:8443';
 
 // 备用服务器列表
 const BACKUP_SERVERS = [
@@ -11,7 +11,7 @@ const BACKUP_SERVERS = [
 ];
 
 // 超时设置
-const LINK_TIMEOUT = 5000; // 增加到5秒
+const LINK_TIMEOUT = 5000;
 const MAX_RETRY = 3;
 
 export default {
@@ -70,15 +70,10 @@ async function handleWebSocket(request, config) {
         }
     }
 
-    serverWS.addEventListener('close', () => {
-        stopHeartbeat();
-    });
+    serverWS.addEventListener('close', stopHeartbeat);
+    serverWS.addEventListener('error', stopHeartbeat);
 
-    serverWS.addEventListener('error', () => {
-        stopHeartbeat();
-    });
-
-    // 正确处理early data
+    // 获取early data，但不尝试解码
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
     const readableStream = createReadableStream(serverWS, earlyData);
     
@@ -94,6 +89,8 @@ async function handleWebSocket(request, config) {
                 buffer = new Uint8Array(dataChunk);
             } else if (dataChunk instanceof Uint8Array) {
                 buffer = dataChunk;
+            } else if (dataChunk instanceof Blob) {
+                buffer = new Uint8Array(await dataChunk.arrayBuffer());
             } else {
                 buffer = new Uint8Array(dataChunk);
             }
@@ -216,20 +213,25 @@ function createReadableStream(ws, earlyData) {
         start(controller) {
             ws.addEventListener('message', event => {
                 let data = event.data;
-                // 处理各种可能的格式
+                
+                // 处理各种格式
                 if (typeof data === 'string') {
-                    data = new TextEncoder().encode(data);
+                    // 如果是字符串，按文本处理
+                    controller.enqueue(new TextEncoder().encode(data));
                 } else if (data instanceof Blob) {
+                    // 如果是Blob，异步读取
                     data.arrayBuffer().then(buf => {
                         controller.enqueue(new Uint8Array(buf));
                     }).catch(err => {
                         console.log('Blob error:', err);
                     });
-                    return;
                 } else if (data instanceof ArrayBuffer) {
-                    data = new Uint8Array(data);
+                    // 如果是ArrayBuffer，直接使用
+                    controller.enqueue(new Uint8Array(data));
+                } else {
+                    // 其他情况，尝试直接使用
+                    controller.enqueue(data);
                 }
-                controller.enqueue(data);
             });
 
             ws.addEventListener('close', () => {
@@ -240,29 +242,19 @@ function createReadableStream(ws, earlyData) {
                 controller.error(err);
             });
 
-            // 处理early data
-            if (earlyData) {
+            // 处理early data - 作为原始二进制数据处理，不尝试解码
+            if (earlyData && earlyData.length > 0) {
                 try {
-                    // 移除所有URL安全字符替换，直接处理base64
-                    let base64 = earlyData;
-                    // 处理Go客户端的特殊格式
-                    if (base64.includes(' ')) {
-                        base64 = base64.split(' ')[0];
+                    // 注意：early data 可能包含非ASCII字符
+                    // 我们将其作为原始字节处理
+                    const bytes = new Uint8Array(earlyData.length);
+                    for (let i = 0; i < earlyData.length; i++) {
+                        bytes[i] = earlyData.charCodeAt(i) & 0xFF;
                     }
-                    // 添加padding
-                    while (base64.length % 4) {
-                        base64 += '=';
-                    }
-                    
-                    const decoded = atob(base64);
-                    const data = new Uint8Array(decoded.length);
-                    for (let i = 0; i < decoded.length; i++) {
-                        data[i] = decoded.charCodeAt(i);
-                    }
-                    console.log('Early data length:', data.length);
-                    controller.enqueue(data);
+                    console.log('Early data length:', bytes.length);
+                    controller.enqueue(bytes);
                 } catch (e) {
-                    console.log('Early data decode error:', e.message);
+                    console.log('Early data error:', e.message);
                 }
             }
         }
@@ -274,65 +266,69 @@ function parseHeader(buffer) {
         return { hasError: true, message: 'Header too short' };
     }
 
-    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-    const version = new Uint8Array(buffer.slice(0, 1));
-    const keyBytes = new Uint8Array(buffer.slice(1, 17));
-    const key = formatKey(keyBytes);
+    try {
+        const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+        const version = new Uint8Array(buffer.slice(0, 1));
+        const keyBytes = new Uint8Array(buffer.slice(1, 17));
+        const key = formatKey(keyBytes);
 
-    if (FIXED_KEY && key !== FIXED_KEY) {
-        return { hasError: true, message: 'Invalid key' };
+        if (FIXED_KEY && key !== FIXED_KEY) {
+            return { hasError: true, message: 'Invalid key' };
+        }
+
+        const optionsLen = view.getUint8(17);
+        const cmd = view.getUint8(18 + optionsLen);
+        let isUdp = false;
+
+        if (cmd === 2) {
+            isUdp = true;
+        } else if (cmd !== 1) {
+            return { hasError: true, message: 'Unsupported command' };
+        }
+
+        let offset = 19 + optionsLen;
+        const port = view.getUint16(offset);
+        offset += 2;
+
+        const addrType = view.getUint8(offset++);
+        let address = '';
+
+        switch (addrType) {
+            case 1: // IPv4
+                const ipBytes = new Uint8Array(buffer.slice(offset, offset + 4));
+                address = Array.from(ipBytes).join('.');
+                offset += 4;
+                break;
+            case 2: // Domain
+                const domainLen = view.getUint8(offset++);
+                const domainBytes = new Uint8Array(buffer.slice(offset, offset + domainLen));
+                address = new TextDecoder().decode(domainBytes);
+                offset += domainLen;
+                break;
+            case 3: // IPv6
+                const ipv6 = [];
+                for (let i = 0; i < 8; i++) {
+                    ipv6.push(view.getUint16(offset).toString(16));
+                    offset += 2;
+                }
+                address = ipv6.join(':');
+                break;
+            default:
+                return { hasError: true, message: 'Unsupported address type' };
+        }
+
+        return {
+            hasError: false,
+            targetAddress: address,
+            targetPort: port,
+            dataOffset: offset,
+            version: version,
+            isUdp: isUdp,
+            addrType: addrType
+        };
+    } catch (err) {
+        return { hasError: true, message: 'Parse error: ' + err.message };
     }
-
-    const optionsLen = view.getUint8(17);
-    const cmd = view.getUint8(18 + optionsLen);
-    let isUdp = false;
-
-    if (cmd === 2) {
-        isUdp = true;
-    } else if (cmd !== 1) {
-        return { hasError: true, message: 'Unsupported command' };
-    }
-
-    let offset = 19 + optionsLen;
-    const port = view.getUint16(offset);
-    offset += 2;
-
-    const addrType = view.getUint8(offset++);
-    let address = '';
-
-    switch (addrType) {
-        case 1: // IPv4
-            const ipBytes = new Uint8Array(buffer.slice(offset, offset + 4));
-            address = Array.from(ipBytes).join('.');
-            offset += 4;
-            break;
-        case 2: // Domain
-            const domainLen = view.getUint8(offset++);
-            const domainBytes = new Uint8Array(buffer.slice(offset, offset + domainLen));
-            address = new TextDecoder().decode(domainBytes);
-            offset += domainLen;
-            break;
-        case 3: // IPv6
-            const ipv6 = [];
-            for (let i = 0; i < 8; i++) {
-                ipv6.push(view.getUint16(offset).toString(16));
-                offset += 2;
-            }
-            address = ipv6.join(':');
-            break;
-        default:
-            return { hasError: true, message: 'Unsupported address type' };
-    }
-
-    return {
-        hasError: false,
-        targetAddress: address,
-        targetPort: port,
-        dataOffset: offset,
-        version: version,
-        isUdp: isUdp,
-        addrType: addrType
-    };
 }
 
 async function transferData(
@@ -413,6 +409,7 @@ async function transferData(
                     initialData,
                     retryCount + 1
                 );
+                return;
             } catch (err) {
                 console.log('Retry failed:', err.message);
             }
