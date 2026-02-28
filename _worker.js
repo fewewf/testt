@@ -1,531 +1,541 @@
-const ФІКСОВАНИЙ_ІДЕНТИФІКАТОР = 'd14bd0e0-9ade-4824-aa96-03bbe680b4db';
-let зворотній_сервер = 'yx1.9898981.xyz:8443';
+const FIXED_KEY = 'd14bd0e0-9ade-4824-aa96-03bbe680b4db';
+let mainServer = 'yx1.9898981.xyz:8443';
 
-// Список резервних проксі-серверів
-const РЕЗЕРВНІ_ПРОКСІ_СЕРВЕРИ = [
-    'ProxyIP.CA.CMLiussss.net:443',
-    'ProxyIP.HK.CMLiussss.net:443',
-    'ProxyIP.SG.CMLiussss.net:443',
-    'ProxyIP.JP.CMLiussss.net:443',
-    'ProxyIP.US.CMLiussss.net:443'
+// 备用服务器列表
+const BACKUP_SERVERS = [
+    'service1.ca.example.net:443',
+    'service2.hk.example.net:443',
+    'service3.sg.example.net:443',
+    'service4.jp.example.net:443',
+    'service5.us.example.net:443'
 ];
 
-// Налаштування таймаутів
-const ЧАСОЧІКУВАННЯ_ПІДКЛЮЧЕННЯ = 3000; // 3 секунди
-const МАКС_СПРОБ_ПРОКСІ = 3;
+// 超时设置
+const LINK_TIMEOUT = 3000;
+const MAX_RETRY = 3;
 
 export default {
-    async fetch(запит) {
+    async fetch(request) {
         try {
-            const адреса = new URL(запит.url);
-            const заголовокОновлення = запит.headers.get('Upgrade');
-            if (заголовокОновлення !== 'websocket') {
-                return new Response('Привіт Світ!', { status: 200 });
+            const url = new URL(request.url);
+            const upgradeHeader = request.headers.get('Upgrade');
+            
+            if (upgradeHeader !== 'websocket') {
+                return new Response('Hello World!', { status: 200 });
             } else {
-                // Оновлюємо сервер з параметрів запиту
-                await оновленняЗворотньогоСервера(запит);
-                
-                // Отримуємо список проксі-серверів для спроб
-                const проксіСервери = await отриматиСписокПроксіСерверів(запит);
-                
-                return await обробкаВебСокету(запит, {
-                    проксіСервери: проксіСервери
-                });
+                await updateMainServer(request);
+                const serverList = await getServerList(request);
+                return await handleWebSocket(request, { serverList });
             }
-        } catch (помилка) {
-            return new Response(помилка && помилка.stack ? помилка.stack : String(помилка), { status: 500 });
+        } catch (error) {
+            return new Response(error && error.stack ? error.stack : String(error), { status: 500 });
         }
     },
 };
 
-async function отриматиСписокПроксіСерверів(запит) {
-    const сервери = [];
+async function getServerList(request) {
+    const servers = [];
     
-    // Додаємо основний сервер
-    const [основнаАдреса, основнийПорт] = await визначенняАдресиПорту(зворотній_сервер);
-    сервери.push({ адреса: основнаАдреса, порт: основнийПорт });
+    const [mainHost, mainPort] = await parseAddress(mainServer);
+    servers.push({ host: mainHost, port: mainPort });
     
-    // Додаємо резервні сервери
-    for (const резервний of РЕЗЕРВНІ_ПРОКСІ_СЕРВЕРИ) {
-        const [адреса, порт] = await визначенняАдресиПорту(резервний);
-        сервери.push({ адреса, порт });
+    for (const backup of BACKUP_SERVERS) {
+        const [host, port] = await parseAddress(backup);
+        servers.push({ host, port });
     }
     
-    return сервери;
+    return servers;
 }
 
-async function обробкаВебСокету(запит, налаштування) {
-    const { проксіСервери } = налаштування;
-    const вебСокетПара = new WebSocketPair();
-    const [клієнтськийВебСокет, сервернийВебСокет] = Object.values(вебСокетПара);
-    
-    сервернийВебСокет.accept();
-    
-    let інтервалСерцебиття = setInterval(() => {
-        if (сервернийВебСокет.readyState === СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ) {
+async function handleWebSocket(request, config) {
+    const { serverList } = config;
+    const wsPair = new WebSocketPair();
+    const [clientWS, serverWS] = Object.values(wsPair);
+
+    serverWS.accept();
+
+    // Heartbeat
+    let heartbeatTimer = setInterval(() => {
+        if (serverWS.readyState === WS_STATE_OPEN) {
             try {
-                сервернийВебСокет.send(new Uint8Array(0));
+                serverWS.send(new Uint8Array(0));
             } catch (e) {}
         }
     }, 30000);
-    
-    function очищенняСерцебиття() {
-        if (інтервалСерцебиття) {
-            clearInterval(інтервалСерцебиття);
-            інтервалСерцебиття = null;
+
+    function stopHeartbeat() {
+        if (heartbeatTimer) {
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = null;
         }
     }
-    
-    сервернийВебСокет.addEventListener('close', (ev) => {
-        очищенняСерцебиття();
-        сервернийВебСокет.close(1000, 'Normal closure'); 
+
+    serverWS.addEventListener('close', () => {
+        stopHeartbeat();
+        serverWS.close(1000, 'Normal closure');
     });
-    
-    сервернийВебСокет.addEventListener('error', (ev) => {
-        очищенняСерцебиття();
-        сервернийВебСокет.close(1011, 'Internal error'); 
+
+    serverWS.addEventListener('error', () => {
+        stopHeartbeat();
+        serverWS.close(1011, 'Internal error');
     });
+
+    const earlyData = request.headers.get('sec-websocket-protocol') || '';
+    const readableStream = createReadableStream(serverWS, earlyData);
     
-    const ранніДаніЗаголовка = запит.headers.get('sec-websocket-protocol') || '';
-    const читабельнийВебСокет = створенняЧитабельногоПотокуВебСокет(сервернийВебСокет, ранніДаніЗаголовка);
-    let віддаленийСокет = null;
-    let записUdpПотоку = null;
-    let цеDns = false;
-    
-    читабельнийВебСокет.pipeTo(new WritableStream({
-        async write(фрагмент) {
-            if (цеDns && записUdpПотоку) {
-                return записUdpПотоку(фрагмент);
+    let remoteConn = null;
+    let udpWriter = null;
+    let isDnsMode = false;
+
+    readableStream.pipeTo(new WritableStream({
+        async write(dataChunk) {
+            // DNS mode
+            if (isDnsMode && udpWriter) {
+                return udpWriter(dataChunk);
             }
-            
-            if (віддаленийСокет) {
+
+            // Forward data if connected
+            if (remoteConn) {
                 try {
-                    const записувач = віддаленийСокет.writable.getWriter();
-                    await записувач.write(фрагмент);
-                    записувач.releaseLock();
-                } catch (помилка) {
-                    закриттяСокета(віддаленийСокет);
-                    throw помилка;
+                    const writer = remoteConn.writable.getWriter();
+                    await writer.write(dataChunk);
+                    writer.releaseLock();
+                } catch (err) {
+                    closeConnection(remoteConn);
+                    throw err;
                 }
                 return;
             }
+
+            // Parse header
+            const parseResult = parseHeader(dataChunk);
+            if (parseResult.hasError) throw new Error(parseResult.message);
             
-            const результат = аналізЗаголовкаVLESS(фрагмент);
-            if (результат.єПомилка) throw new Error(результат.повідомлення);
-            if (результат.адресаВіддаленого.includes(atob('c3BlZWQuY2xvdWRmbGFyZS5jb20='))) throw new Error('Доступ заборонено');
-            
-            const відповідьVless = new Uint8Array([результат.версіяVless[0], 0]);
-            const сиріДаніКлієнта = фрагмент.slice(результат.індексСиріхДаних);
-            
-            if (результат.цеUDP) {
-                if (результат.портВіддаленого === 53) {
-                    цеDns = true;
-                    const { write } = await обробкаUdpВиходу(сервернийВебСокет, відповідьVless);
-                    записUdpПотоку = write;
-                    записUdpПотоку(сиріДаніКлієнта);
+            // Block specific domain
+            if (parseResult.targetAddress.includes(atob('c3BlZWQuY2xvdWRmbGFyZS5jb20='))) {
+                throw new Error('Access Denied');
+            }
+
+            const responseHeader = new Uint8Array([parseResult.version[0], 0]);
+            const clientData = dataChunk.slice(parseResult.dataOffset);
+
+            // UDP DNS handling
+            if (parseResult.isUdp) {
+                if (parseResult.targetPort === 53) {
+                    isDnsMode = true;
+                    const { write } = await handleUDP(serverWS, responseHeader);
+                    udpWriter = write;
+                    udpWriter(clientData);
                     return;
                 } else {
-                    throw new Error('UDP підтримує лише DNS (порт 53)');
+                    throw new Error('UDP only supports port 53');
                 }
             }
-            
-            // TCP з'єднання з таймаутом
-            async function підключенняЗТаймаутом(адреса, порт) {
-                const контролер = new AbortController();
-                const таймер = setTimeout(() => контролер.abort(), ЧАСОЧІКУВАННЯ_ПІДКЛЮЧЕННЯ);
-                
+
+            // TCP connection with timeout
+            async function connectWithTimeout(host, port, timeout = LINK_TIMEOUT) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeout);
+
                 try {
-                    const сокет = await connect(
-                        { hostname: адреса, port: порт }, 
-                        { signal: контролер.signal }
+                    const socket = await connect(
+                        { hostname: host, port: port },
+                        { signal: controller.signal }
                     );
-                    clearTimeout(таймер);
-                    return сокет;
-                } catch (помилка) {
-                    clearTimeout(таймер);
-                    throw помилка;
+                    clearTimeout(timer);
+                    return socket;
+                } catch (err) {
+                    clearTimeout(timer);
+                    throw err;
                 }
             }
-            
-            // Спочатку підключаємось до цільового сервера
+
+            // Connect to target
             try {
-                віддаленийСокет = await підключенняЗТаймаутом(
-                    результат.адресаВіддаленого, 
-                    результат.портВіддаленого
+                remoteConn = await connectWithTimeout(
+                    parseResult.targetAddress,
+                    parseResult.targetPort
                 );
-                
-                // Відправляємо дані
-                const записувач = віддаленийСокет.writable.getWriter();
-                await записувач.write(сиріДаніКлієнта);
-                записувач.releaseLock();
-                
-                // Передаємо дані
-                передачаДанихДоВебСокету(
-                    віддаленийСокет, 
-                    сервернийВебСокет, 
-                    відповідьVless,
-                    проксіСервери, // Передаємо список проксі для резерву
-                    результат.адресаВіддаленого,
-                    результат.портВіддаленого,
-                    сиріДаніКлієнта
+
+                const writer = remoteConn.writable.getWriter();
+                await writer.write(clientData);
+                writer.releaseLock();
+
+                // Start data transfer
+                transferData(
+                    remoteConn,
+                    serverWS,
+                    responseHeader,
+                    serverList,
+                    parseResult.targetAddress,
+                    parseResult.targetPort,
+                    clientData
                 );
-            } catch (помилка) {
-                console.log(`Помилка підключення до ${результат.адресаВіддаленого}:${результат.портВіддаленого}:`, помилка.message);
-                закриттяСокета(віддаленийСокет);
-                сервернийВебСокет.close(1011, 'Помилка з\'єднання: ' + (помилка && помилка.message ? помилка.message : помилка));
+            } catch (err) {
+                console.log(`Connection failed to ${parseResult.targetAddress}:${parseResult.targetPort}:`, err.message);
+                closeConnection(remoteConn);
+                serverWS.close(1011, 'Connection error: ' + (err && err.message ? err.message : err));
             }
         },
         close() {
-            if (віддаленийСокет) {
-                закриттяСокета(віддаленийСокет);
+            if (remoteConn) {
+                closeConnection(remoteConn);
             }
         }
-    })).catch(помилка => {
-        закриттяСокета(віддаленийСокет);
-        if (сервернийВебСокет.readyState === СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ) {
-            сервернийВебСокет.close(1011, 'Внутрішня помилка: ' + (помилка && помилка.message ? помилка.message : помилка));
+    })).catch(err => {
+        closeConnection(remoteConn);
+        if (serverWS.readyState === WS_STATE_OPEN) {
+            serverWS.close(1011, 'Internal error: ' + (err && err.message ? err.message : err));
         }
     });
-    
+
     return new Response(null, {
         status: 101,
-        webSocket: клієнтськийВебСокет,
+        webSocket: clientWS,
     });
 }
 
-function створенняЧитабельногоПотокуВебСокет(вебСокет, ранніДаніЗаголовка) {
+function createReadableStream(ws, earlyData) {
     return new ReadableStream({
-        start(контролер) {
-            вебСокет.addEventListener('message', подія => {
-                контролер.enqueue(подія.data);
+        start(controller) {
+            ws.addEventListener('message', event => {
+                let data = event.data;
+                if (typeof data === 'string') {
+                    data = new TextEncoder().encode(data);
+                } else if (data instanceof ArrayBuffer) {
+                    data = new Uint8Array(data);
+                }
+                controller.enqueue(data);
             });
-            
-            вебСокет.addEventListener('close', () => {
-                контролер.close();
+
+            ws.addEventListener('close', () => {
+                controller.close();
             });
-            
-            вебСокет.addEventListener('error', помилка => {
-                контролер.error(помилка);
+
+            ws.addEventListener('error', err => {
+                controller.error(err);
             });
-            
-            if (ранніДаніЗаголовка) {
+
+            if (earlyData) {
                 try {
-                    const розкодовано = atob(ранніДаніЗаголовка.replace(/-/g, '+').replace(/_/g, '/'));
-                    const дані = Uint8Array.from(розкодовано, с => с.charCodeAt(0));
-                    контролер.enqueue(дані.buffer);
+                    const decoded = atob(earlyData.replace(/-/g, '+').replace(/_/g, '/'));
+                    const data = Uint8Array.from(decoded, c => c.charCodeAt(0));
+                    controller.enqueue(data);
                 } catch (e) {}
             }
         }
     });
 }
 
-function аналізЗаголовкаVLESS(буфер) {
-    if (буфер.byteLength < 24) {
-        return { єПомилка: true, повідомлення: 'Недійсна довжина заголовка' };
+function parseHeader(buffer) {
+    if (buffer.byteLength < 24) {
+        return { hasError: true, message: 'Invalid header length' };
     }
-    
-    const переглядач = new DataView(буфер);
-    const версія = new Uint8Array(буфер.slice(0, 1));
-    const ідентифікатор = форматуванняІдентифікатора(new Uint8Array(буфер.slice(1, 17)));
-    
-    if (ФІКСОВАНИЙ_ІДЕНТИФІКАТОР && ідентифікатор !== ФІКСОВАНИЙ_ІДЕНТИФІКАТОР) {
-        return { єПомилка: true, повідомлення: 'Недійсний користувач' };
+
+    const view = new DataView(buffer);
+    const version = new Uint8Array(buffer.slice(0, 1));
+    const keyBytes = new Uint8Array(buffer.slice(1, 17));
+    const key = formatKey(keyBytes);
+
+    if (FIXED_KEY && key !== FIXED_KEY) {
+        return { hasError: true, message: 'Invalid key' };
     }
-    
-    const довжинаОпцій = переглядач.getUint8(17);
-    const команда = переглядач.getUint8(18 + довжинаОпцій);
-    let цеUDP = false;
-    
-    if (команда === 2) {
-        цеUDP = true;
-    } else if (команда !== 1) {
-        return { єПомилка: true, повідомлення: 'Непідтримувана команда, підтримується лише TCP(01) та UDP(02)' };
+
+    const optionsLen = view.getUint8(17);
+    const cmd = view.getUint8(18 + optionsLen);
+    let isUdp = false;
+
+    if (cmd === 2) {
+        isUdp = true;
+    } else if (cmd !== 1) {
+        return { hasError: true, message: 'Unsupported command' };
     }
-    
-    let зміщення = 19 + довжинаОпцій;
-    const порт = переглядач.getUint16(зміщення);
-    зміщення += 2;
-    
-    const типАдреси = переглядач.getUint8(зміщення++);
-    let адреса = '';
-    
-    switch (типАдреси) {
+
+    let offset = 19 + optionsLen;
+    const port = view.getUint16(offset);
+    offset += 2;
+
+    const addrType = view.getUint8(offset++);
+    let address = '';
+
+    switch (addrType) {
         case 1:
-            адреса = Array.from(new Uint8Array(буфер.slice(зміщення, зміщення + 4))).join('.');
-            зміщення += 4;
+            address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
+            offset += 4;
             break;
         case 2:
-            const довжинаДомена = переглядач.getUint8(зміщення++);
-            адреса = new TextDecoder().decode(буфер.slice(зміщення, зміщення + довжинаДомена));
-            зміщення += довжинаДомена;
+            const domainLen = view.getUint8(offset++);
+            address = new TextDecoder().decode(buffer.slice(offset, offset + domainLen));
+            offset += domainLen;
             break;
         case 3:
             const ipv6 = [];
             for (let i = 0; i < 8; i++) {
-                ipv6.push(переглядач.getUint16(зміщення).toString(16).padStart(4, '0'));
-                зміщення += 2;
+                ipv6.push(view.getUint16(offset).toString(16).padStart(4, '0'));
+                offset += 2;
             }
-            адреса = ipv6.join(':').replace(/(^|:)0+(\w)/g, '$1$2');
+            address = ipv6.join(':').replace(/(^|:)0+(\w)/g, '$1$2');
             break;
         default:
-            return { єПомилка: true, повідомлення: 'Непідтримуваний тип адреси' };
+            return { hasError: true, message: 'Unsupported address type' };
     }
-    
+
     return {
-        єПомилка: false,
-        адресаВіддаленого: адреса,
-        портВіддаленого: порт,
-        індексСиріхДаних: зміщення,
-        версіяVless: версія,
-        цеUDP,
-        типАдреси
+        hasError: false,
+        targetAddress: address,
+        targetPort: port,
+        dataOffset: offset,
+        version: version,
+        isUdp: isUdp,
+        addrType: addrType
     };
 }
 
-async function передачаДанихДоВебСокету(
-    віддаленийСокет, 
-    вебСокет, 
-    заголовокVless,
-    проксіСервери,
-    цільоваАдреса,
-    цільовийПорт,
-    початковіДані,
-    лічильникСпроб = 0
+async function transferData(
+    remoteSocket,
+    webSocket,
+    header,
+    serverList,
+    targetHost,
+    targetPort,
+    initialData,
+    retryCount = 0
 ) {
-    const МАКС_РОЗМІР_ФРАГМЕНТА = 128 * 1024;
-    const МАКС_РОЗМІР_БУФЕРА = 2 * 1024 * 1024;
-    const ІНТЕРВАЛ_ОЧИЩЕННЯ = 10;
-    
-    let заголовокНадіслано = false;
-    let чергаБуфера = [];
-    let байтівУБуфері = 0;
-    let зєднанняВтрачено = false;
-    
-    const обєднанняМасивів = (фрагменти) => {
-        if (фрагменти.length === 1) return фрагменти[0];
-        let загальнийРозмір = 0;
-        for (const ф of фрагменти) загальнийРозмір += ф.byteLength;
-        const обєднаний = new Uint8Array(загальнийРозмір);
-        let зміщення = 0;
-        for (const ф of фрагменти) {
-            обєднаний.set(ф, зміщення);
-            зміщення += ф.byteLength;
+    const MAX_FRAGMENT = 128 * 1024;
+    const MAX_BUFFER = 2 * 1024 * 1024;
+    const FLUSH_INTERVAL = 10;
+
+    let headerSent = false;
+    let bufferQueue = [];
+    let bufferedSize = 0;
+    let linkLost = false;
+
+    const mergeBuffers = (buffers) => {
+        if (buffers.length === 1) return buffers[0];
+        let total = 0;
+        for (const buf of buffers) total += buf.byteLength;
+        const merged = new Uint8Array(total);
+        let pos = 0;
+        for (const buf of buffers) {
+            merged.set(buf, pos);
+            pos += buf.byteLength;
         }
-        return обєднаний;
+        return merged;
     };
-    
-    const надсиланняФрагментами = (дані) => {
-        let зміщення = 0;
-        while (зміщення < дані.byteLength) {
-            const кінець = Math.min(зміщення + МАКС_РОЗМІР_ФРАГМЕНТА, дані.byteLength);
-            вебСокет.send(дані.slice(зміщення, кінець));
-            зміщення = кінець;
+
+    const sendFragmented = (data) => {
+        let pos = 0;
+        while (pos < data.byteLength) {
+            const end = Math.min(pos + MAX_FRAGMENT, data.byteLength);
+            webSocket.send(data.slice(pos, end));
+            pos = end;
         }
     };
-    
-    const очищенняЧергиБуфера = () => {
-        if (вебСокет.readyState !== СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ || чергаБуфера.length === 0) return;
-        const обєднаний = обєднанняМасивів(чергаБуфера);
-        чергаБуфера = [];
-        байтівУБуфері = 0;
-        надсиланняФрагментами(обєднаний);
+
+    const flushQueue = () => {
+        if (webSocket.readyState !== WS_STATE_OPEN || bufferQueue.length === 0) return;
+        const merged = mergeBuffers(bufferQueue);
+        bufferQueue = [];
+        bufferedSize = 0;
+        sendFragmented(merged);
     };
-    
-    const таймерОчищення = setInterval(очищенняЧергиБуфера, ІНТЕРВАЛ_ОЧИЩЕННЯ);
-    
+
+    const flushTimer = setInterval(flushQueue, FLUSH_INTERVAL);
+
     try {
-        const читач = віддаленийСокет.readable.getReader();
-        let отриманіДані = false;
-        
+        const reader = remoteSocket.readable.getReader();
+        let hasData = false;
+
         while (true) {
-            const { done, value } = await читач.read();
+            const { done, value } = await reader.read();
             if (done) break;
-            
-            отриманіДані = true;
-            
-            if (вебСокет.readyState !== СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ) break;
-            
-            if (!заголовокНадіслано) {
-                const обєднаний = new Uint8Array(заголовокVless.byteLength + value.byteLength);
-                обєднаний.set(new Uint8Array(заголовокVless), 0);
-                обєднаний.set(value, заголовокVless.byteLength);
-                чергаБуфера.push(обєднаний);
-                байтівУБуфері += обєднаний.byteLength;
-                заголовокНадіслано = true;
+
+            hasData = true;
+
+            if (webSocket.readyState !== WS_STATE_OPEN) break;
+
+            if (!headerSent) {
+                const combined = new Uint8Array(header.byteLength + value.byteLength);
+                combined.set(new Uint8Array(header), 0);
+                combined.set(value, header.byteLength);
+                bufferQueue.push(combined);
+                bufferedSize += combined.byteLength;
+                headerSent = true;
             } else {
-                чергаБуфера.push(value);
-                байтівУБуфері += value.byteLength;
+                bufferQueue.push(value);
+                bufferedSize += value.byteLength;
             }
-            
-            if (байтівУБуфері >= МАКС_РОЗМІР_БУФЕРА) {
-                очищенняЧергиБуфера();
+
+            if (bufferedSize >= MAX_BUFFER) {
+                flushQueue();
             }
         }
-        
-        читач.releaseLock();
-        очищенняЧергиБуфера();
-        clearInterval(таймерОчищення);
-        
-        if (!отриманіДані && лічильникСпроб < МАКС_СПРОБ_ПРОКСІ) {
-            // Спроба перепідключення через інший проксі
-            зєднанняВтрачено = true;
-            const наступнийПроксі = лічильникСпроб + 1 < проксіСервери.length 
-                ? проксіСервери[лічильникСпроб + 1] 
-                : проксіСервери[0];
-            
-            console.log(`Спроба перепідключення через проксі ${лічильникСпроб + 2}: ${наступнийПроксі.адреса}:${наступнийПроксі.порт}`);
-            
+
+        reader.releaseLock();
+        flushQueue();
+        clearInterval(flushTimer);
+
+        // Retry if no data and we have backup servers
+        if (!hasData && retryCount < MAX_RETRY && serverList.length > 1) {
+            linkLost = true;
+            const nextIndex = (retryCount + 1) % serverList.length;
+            const nextServer = serverList[nextIndex];
+
+            console.log(`Retry ${nextIndex + 1}: ${nextServer.host}:${nextServer.port}`);
+
             try {
-                // Підключаємось до цільового сервера через новий проксі
-                const новийСокет = await connect({ 
-                    hostname: цільоваАдреса, 
-                    port: цільовийПорт 
+                const newSocket = await connect({
+                    hostname: targetHost,
+                    port: targetPort
                 });
-                
-                const записувач = новийСокет.writable.getWriter();
-                await записувач.write(початковіДані);
-                записувач.releaseLock();
-                
-                // Рекурсивно викликаємо функцію з новим сокетом
-                await передачаДанихДоВебСокету(
-                    новийСокет, 
-                    вебСокет, 
-                    заголовокVless,
-                    проксіСервери,
-                    цільоваАдреса,
-                    цільовийПорт,
-                    початковіДані,
-                    лічильникСпроб + 1
+
+                const writer = newSocket.writable.getWriter();
+                await writer.write(initialData);
+                writer.releaseLock();
+
+                await transferData(
+                    newSocket,
+                    webSocket,
+                    header,
+                    serverList,
+                    targetHost,
+                    targetPort,
+                    initialData,
+                    retryCount + 1
                 );
-            } catch (помилка) {
-                console.log(`Помилка перепідключення:`, помилка.message);
-                закриттяСокета(віддаленийСокет);
-                if (вебСокет.readyState === СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ) {
-                    вебСокет.close(1011, 'Помилка перепідключення');
+            } catch (err) {
+                console.log('Retry failed:', err.message);
+                closeConnection(remoteSocket);
+                if (webSocket.readyState === WS_STATE_OPEN) {
+                    webSocket.close(1011, 'Retry failed');
                 }
             }
             return;
         }
-        
-        if (вебСокет.readyState === СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ && !зєднанняВтрачено) {
-            вебСокет.close(1000, 'Нормальне закриття');
+
+        if (webSocket.readyState === WS_STATE_OPEN && !linkLost) {
+            webSocket.close(1000, 'Done');
         }
-    } catch (помилка) {
-        clearInterval(таймерОчищення);
-        закриттяСокета(віддаленийСокет);
-        if (вебСокет.readyState === СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ) {
-            вебСокет.close(1011, 'Помилка передачі даних');
+    } catch (err) {
+        clearInterval(flushTimer);
+        closeConnection(remoteSocket);
+        if (webSocket.readyState === WS_STATE_OPEN) {
+            webSocket.close(1011, 'Transfer error');
         }
     }
 }
 
-function закриттяСокета(сокет) {
-    if (сокет) {
+function closeConnection(socket) {
+    if (socket) {
         try {
-            сокет.close();
+            socket.close();
         } catch (e) {}
     }
 }
 
-function форматуванняІдентифікатора(байти) {
-    const шістнадцятковий = Array.from(байти, б => б.toString(16).padStart(2, '0')).join('');
-    return `${шістнадцятковий.slice(0, 8)}-${шістнадцятковий.slice(8, 12)}-${шістнадцятковий.slice(12, 16)}-${шістнадцятковий.slice(16, 20)}-${шістнадцятковий.slice(20)}`;
+function formatKey(bytes) {
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-async function обробкаUdpВиходу(вебСокет, заголовокВідповіді) {
-    let заголовокVlessНадіслано = false;
-    
-    const потікПеретворення = new TransformStream({
-        transform(фрагмент, контролер) {
-            for (let індекс = 0; індекс < фрагмент.byteLength;) {
-                const довжинаUdpПакета = new DataView(фрагмент.slice(індекс, індекс + 2)).getUint16(0);
-                const udpДані = new Uint8Array(фрагмент.slice(індекс + 2, індекс + 2 + довжинаUdpПакета));
-                індекс = індекс + 2 + довжинаUdpПакета;
-                контролер.enqueue(udpДані);
+async function handleUDP(webSocket, responseHeader) {
+    let headerSent = false;
+
+    const transform = new TransformStream({
+        transform(chunk, controller) {
+            for (let idx = 0; idx < chunk.byteLength;) {
+                const lenBuf = chunk.slice(idx, idx + 2);
+                const pktLen = new DataView(lenBuf).getUint16(0);
+                const udpData = new Uint8Array(
+                    chunk.slice(idx + 2, idx + 2 + pktLen)
+                );
+                idx = idx + 2 + pktLen;
+                controller.enqueue(udpData);
             }
         }
     });
-    
-    потікПеретворення.readable.pipeTo(new WritableStream({
-        async write(фрагмент) {
+
+    transform.readable.pipeTo(new WritableStream({
+        async write(chunk) {
             try {
-                const відповідь = await fetch('https://1.1.1.1/dns-query', {
+                const response = await fetch('https://1.1.1.1/dns-query', {
                     method: 'POST',
                     headers: { 'content-type': 'application/dns-message' },
-                    body: фрагмент,
+                    body: chunk,
                 });
-                
-                const результатDns = await відповідь.arrayBuffer();
-                const розмірUdp = результатDns.byteLength;
-                const буферРозміруUdp = new Uint8Array([(розмірUdp >> 8) & 0xff, розмірUdp & 0xff]);
-                
-                if (вебСокет.readyState === СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ) {
-                    if (заголовокVlessНадіслано) {
-                        вебСокет.send(await new Blob([буферРозміруUdp, результатDns]).arrayBuffer());
+
+                const result = await response.arrayBuffer();
+                const size = result.byteLength;
+                const sizeBuf = new Uint8Array([(size >> 8) & 0xff, size & 0xff]);
+
+                if (webSocket.readyState === WS_STATE_OPEN) {
+                    if (headerSent) {
+                        webSocket.send(await new Blob([sizeBuf, result]).arrayBuffer());
                     } else {
-                        вебСокет.send(await new Blob([заголовокВідповіді, буферРозміруUdp, результатDns]).arrayBuffer());
-                        заголовокVlessНадіслано = true;
+                        webSocket.send(await new Blob([responseHeader, sizeBuf, result]).arrayBuffer());
+                        headerSent = true;
                     }
                 }
-            } catch (помилка) {}
+            } catch (err) {}
         }
     })).catch(() => {});
-    
-    const записувач = потікПеретворення.writable.getWriter();
-    
+
+    const writer = transform.writable.getWriter();
+
     return {
-        write(фрагмент) {
-            записувач.write(фрагмент).catch(() => {});
+        write(chunk) {
+            writer.write(chunk).catch(() => {});
         }
     };
 }
 
-const СТАН_ВІДКРИТОГО_ВЕБСОКЕТУ = 1;
+const WS_STATE_OPEN = 1;
 import { connect } from 'cloudflare:sockets';
 
-async function визначенняАдресиПорту(зворотнійСервер) {
-    зворотнійСервер = зворотнійСервер.toLowerCase();
-    let адреса = зворотнійСервер, порт = 443;
-    
-    if (зворотнійСервер.includes('.tp')) {
-        const tpЗбіг = зворотнійСервер.match(/.tp(\d+)/);
-        if (tpЗбіг) порт = parseInt(tpЗбіг[1], 10);
-        return [адреса, порт];
+async function parseAddress(serverAddr) {
+    serverAddr = serverAddr.toLowerCase();
+    let host = serverAddr;
+    let port = 443;
+
+    if (serverAddr.includes('.tp')) {
+        const match = serverAddr.match(/\.tp(\d+)/);
+        if (match) port = parseInt(match[1], 10);
+        return [host, port];
     }
-    
-    if (зворотнійСервер.includes(']:')) {
-        const частини = зворотнійСервер.split(']:');
-        адреса = частини[0] + ']';
-        порт = parseInt(частини[1], 10) || порт;
-    } else if (зворотнійСервер.includes(':') && !зворотнійСервер.startsWith('[')) {
-        const позиціяДвокрапки = зворотнійСервер.lastIndexOf(':');
-        адреса = зворотнійСервер.slice(0, позиціяДвокрапки);
-        порт = parseInt(зворотнійСервер.slice(позиціяДвокрапки + 1), 10) || порт;
+
+    if (serverAddr.includes(']:')) {
+        const parts = serverAddr.split(']:');
+        host = parts[0] + ']';
+        port = parseInt(parts[1], 10) || port;
+    } else if (serverAddr.includes(':') && !serverAddr.startsWith('[')) {
+        const colonIdx = serverAddr.lastIndexOf(':');
+        host = serverAddr.slice(0, colonIdx);
+        port = parseInt(serverAddr.slice(colonIdx + 1), 10) || port;
     }
-    
-    return [адреса, порт];
+
+    return [host, port];
 }
 
-async function оновленняЗворотньогоСервера(запит) {
-    const адреса = new URL(запит.url);
-    const { pathname, searchParams } = адреса;
-    const шляхНижній = pathname.toLowerCase();
-    
-    const збігПеренаправлення = шляхНижній.match(/\/(proxyip[.=]|pyip=|ip=)(.+)/);
-    
+async function updateMainServer(request) {
+    const url = new URL(request.url);
+    const { pathname, searchParams } = url;
+    const pathLower = pathname.toLowerCase();
+
+    const match = pathLower.match(/\/(proxyip[.=]|pyip=|ip=)(.+)/);
+
     if (searchParams.has('proxyip')) {
-        const параметрIP = searchParams.get('proxyip');
-        зворотній_сервер = параметрIP.includes(',') 
-            ? параметрIP.split(',')[Math.floor(Math.random() * параметрIP.split(',').length)] 
-            : параметрIP;
+        const param = searchParams.get('proxyip');
+        mainServer = param.includes(',') 
+            ? param.split(',')[Math.floor(Math.random() * param.split(',').length)] 
+            : param;
         return;
-    } else if (збігПеренаправлення) {
-        const параметрIP = збігПеренаправлення[1] === 'proxyip.' 
-            ? `proxyip.${збігПеренаправлення[2]}` 
-            : збігПеренаправлення[2];
-        зворотній_сервер = параметрIP.includes(',') 
-            ? параметрIP.split(',')[Math.floor(Math.random() * параметрIP.split(',').length)] 
-            : параметрIP;
+    } else if (match) {
+        const param = match[1] === 'proxyip.' 
+            ? `proxyip.${match[2]}` 
+            : match[2];
+        mainServer = param.includes(',') 
+            ? param.split(',')[Math.floor(Math.random() * param.split(',').length)] 
+            : param;
         return;
     }
 }
