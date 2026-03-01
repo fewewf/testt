@@ -1,20 +1,21 @@
 import { connect } from 'cloudflare:sockets';
 
+// --- 配置区 ---
 const SECRET_PATH = '/tunnel-vip-2026/auth-888999';
 const UUID = '56892533-7dad-475a-b0e8-51040d0d04ad';
-
-// 如果你确定不需要代理，可以将 PROXY_HOST 设为 null
-const PROXY_HOST = 'ProxyIP.FR.CMLiussss.net';
+const PROXY_HOST = 'ProxyIP.FR.CMLiussss.net'; // 你的优选IP/代理
 const PROXY_PORT = 443;
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+    // 1. 验证路径与 WebSocket 升级
     if (url.pathname !== SECRET_PATH) return new Response('Not Found', { status: 404 });
     if (request.headers.get('Upgrade') !== 'websocket') return new Response('Unauthorized', { status: 401 });
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+
     server.accept();
     handleVLESS(server);
 
@@ -34,7 +35,7 @@ async function handleVLESS(ws) {
       const buf = new Uint8Array(event.data);
 
       if (!remoteSocket) {
-        // --- 握手解析 ---
+        // --- 1. VLESS 协议解析 ---
         if (buf.length < 24) return ws.close();
         const clientUUID = Array.from(buf.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
         if (clientUUID !== cleanUUID) return ws.close();
@@ -42,7 +43,7 @@ async function handleVLESS(ws) {
         const addonLen = buf[17];
         let cursor = 18 + addonLen;
         const command = buf[cursor++]; 
-        if (command !== 1) return ws.close(); 
+        if (command !== 1) return ws.close(); // 只支持 TCP
 
         const port = (buf[cursor] << 8) | buf[cursor + 1];
         cursor += 2;
@@ -53,25 +54,34 @@ async function handleVLESS(ws) {
         else if (addrType === 2) {
           const len = buf[cursor];
           address = new TextDecoder().decode(buf.slice(cursor + 1, cursor + 1 + len));
+          cursor += 1 + len;
+        } else if (addrType === 3) {
+          // IPv6 简易处理
+          address = Array.from({ length: 8 }, (_, i) => 
+            ((buf[cursor + i * 2] << 8) | buf[cursor + i * 2 + 1]).toString(16)
+          ).join(':');
+          cursor += 16;
         }
 
-        // --- 核心：尝试建立连接 ---
-        const result = await connectRemote(address, port);
-        remoteSocket = result.socket;
+        // --- 2. 核心：建立连接 (含 Fallback 逻辑) ---
+        // 这里的 dataToForward 是 VLESS 的首包剩余数据（Payload）
+        const dataToForward = buf.slice(cursor);
+        remoteSocket = await connectWithFallback(address, port, PROXY_HOST, PROXY_PORT);
+        
         writer = remoteSocket.writable.getWriter();
+        ws.send(new Uint8Array([0, 0])); // 回复 VLESS 握手成功
 
-        ws.send(new Uint8Array([0, 0])); // VLESS 成功响应
+        // --- 3. 管道转发 ---
         pipeTCP2WS(ws, remoteSocket);
 
-        if (result.leftover?.length) ws.send(result.leftover);
-        
-        // 发送首包剩余数据
-        const headerLen = (addrType === 1) ? cursor + 4 : (addrType === 2) ? cursor + 1 + buf[cursor] : cursor + 16;
-        const rawData = buf.slice(headerLen);
-        if (rawData.length > 0) await writer.write(rawData);
+        // 发送首包中携带的剩余数据
+        if (dataToForward.length > 0) {
+          await writer.write(dataToForward);
+        }
         return;
       }
 
+      // 后续数据直接写入
       await writer.write(buf);
     } catch (err) {
       console.error(`[VLESS Error] ${err.message}`);
@@ -80,67 +90,40 @@ async function handleVLESS(ws) {
   });
 }
 
-async function connectRemote(address, port) {
-  // 1. 优先尝试直连 (Direct Connect)
+/**
+ * 核心递归 Fallback 函数
+ */
+async function connectWithFallback(address, port, proxyHost, proxyPort) {
   try {
+    // 尝试直连
+    console.log(`Connecting directly to ${address}:${port}`);
     const socket = connect({ hostname: address, port });
     await socket.opened;
-    return { socket, leftover: null };
+    return socket;
   } catch (e) {
-    console.log(`Direct connect to ${address}:${port} failed, trying proxy...`);
+    console.error(`Direct connect failed: ${e.message}. Trying Fallback...`);
     
-    // 2. 直连失败，尝试代理
-    if (!PROXY_HOST) throw new Error("Direct connect failed and no proxy configured");
+    if (!proxyHost) throw new Error("Direct connect failed and no proxy configured");
 
-    const socket = connect({ hostname: PROXY_HOST, port: PROXY_PORT });
-    await socket.opened;
-
-    const pWriter = socket.writable.getWriter();
-    const pReader = socket.readable.getReader();
-
-    // 修改后的握手构造
-    const hello = [
-  `CONNECT ${address}:${port} HTTP/1.1`,
-  `Host: ${address}:${port}`,
-  `Proxy-Connection: Keep-Alive`,
-  `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0`,
-  `Connection: Keep-Alive`,
-  '\r\n' // 结尾必须有额外的换行
-   ].join('\r\n');
-
- await pWriter.write(new TextEncoder().encode(hello));
- await pWriter.write(new TextEncoder().encode(hello));
-    pWriter.releaseLock();
-
-    let buf = new Uint8Array(0);
-    while (true) {
-      const { value, done } = await pReader.read();
-      if (done) throw new Error("Proxy connection closed during handshake");
-      buf = concat(buf, value);
-      const text = new TextDecoder().decode(buf);
-      if (text.includes("\r\n\r\n")) {
-        const firstLine = text.split('\r\n')[0];
-        if (!text.includes("200")) {
-            // 这里会抛出具体的响应行，例如 "HTTP/1.1 407 Proxy Authentication Required"
-            throw new Error(`Proxy rejected: ${firstLine}`);
-        }
-        pReader.releaseLock();
-        return { socket, leftover: buf.slice(text.indexOf("\r\n\r\n") + 4) };
-      }
+    // 【关键修改】：Fallback 时直接连接代理 IP，不发送 HTTP CONNECT
+    // 代理 IP (CMLiussss) 会接收到原始 VLESS 数据流并根据其中的目标地址进行转发
+    try {
+      const socket = connect({ hostname: proxyHost, port: proxyPort });
+      await socket.opened;
+      console.log(`Fallback connected via ${proxyHost}`);
+      return socket;
+    } catch (proxyErr) {
+      throw new Error(`Fallback failed: ${proxyErr.message}`);
     }
   }
 }
 
 function pipeTCP2WS(ws, socket) {
   socket.readable.pipeTo(new WritableStream({
-    write(chunk) { if (ws.readyState === 1) ws.send(chunk); },
+    write(chunk) { 
+      if (ws.readyState === 1) ws.send(chunk); 
+    },
     close() { ws.close(); },
     abort() { ws.close(); }
   })).catch(() => ws.close());
-}
-
-function concat(a, b) {
-  const c = new Uint8Array(a.length + b.length);
-  c.set(a); c.set(b, a.length);
-  return c;
 }
