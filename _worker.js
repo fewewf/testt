@@ -1,7 +1,7 @@
 import { connect } from 'cloudflare:sockets';
 
 const AUTH_TOKEN = 'your-secret-token';
-const DEFAULT_PROXY_IP = 'yx1.98981.xyz'; // 建议填入你的后端IP或域名
+const DEFAULT_PROXY_IP = 'yx1.9898981.xyz'; // 建议填入你的后端IP或域名
 const DEFAULT_PROXY_PORT = 8443;
 
 export default {
