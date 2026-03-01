@@ -1,36 +1,27 @@
 import { connect } from 'cloudflare:sockets';
 
-// ================= 配置区 =================
 const SECRET_PATH = '/tunnel-vip-2026/auth-888999';
 const UUID = '56892533-7dad-475a-b0e8-51040d0d04ad';
-
-// 你的 HTTP 代理服务器地址和端口
 const PROXY_HOST = 'yx1.9898981.xyz';
 const PROXY_PORT = 8443;
-// ==========================================
 
 export default {
     async fetch(request) {
         const url = new URL(request.url);
-        if (url.pathname !== SECRET_PATH) {
-            return new Response('404 Not Found', { status: 404 });
-        }
-
+        if (url.pathname !== SECRET_PATH) return new Response('Not Found', { status: 404 });
         const upgradeHeader = request.headers.get('Upgrade');
-        if (upgradeHeader !== 'websocket') {
-            return new Response('Not Authorized', { status: 401 });
-        }
+        if (upgradeHeader !== 'websocket') return new Response('Unauthorized', { status: 401 });
 
         const [client, server] = Object.values(new WebSocketPair());
         server.accept();
         handleVLESS(server);
-
         return new Response(null, { status: 101, webSocket: client });
     }
 };
 
 async function handleVLESS(ws) {
     let remoteSocket = null;
+    const cleanUUID = UUID.replace(/-/g, '');
 
     ws.addEventListener('message', async (event) => {
         const message = event.data;
@@ -41,77 +32,70 @@ async function handleVLESS(ws) {
             return;
         }
 
-        const vlessBuffer = new Uint8Array(message);
-        if (vlessBuffer.length < 24) return;
+        const buf = new Uint8Array(message);
+        // VLESS 握手包解析
+        // 0:版本, 1-16:UUID, 17:addonLen
+        const clientUUID = Array.from(buf.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
+        if (clientUUID !== cleanUUID) { ws.close(); return; }
 
-        // UUID 验证
-        const clientUUID = Array.from(vlessBuffer.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
-        if (clientUUID !== UUID.replace(/-/g, '')) {
-            ws.close();
-            return;
-        }
-
-        // 解析目标地址
-        const optLen = vlessBuffer[17];
-        const port = (vlessBuffer[18 + optLen] << 8) | vlessBuffer[19 + optLen];
-        const addrType = vlessBuffer[20 + optLen];
+        const addonLen = buf[17];
+        const port = (buf[18 + addonLen] << 8) | buf[19 + addonLen];
+        const addrType = buf[20 + addonLen];
         let address = '';
-        let offset = 21 + optLen;
+        let offset = 21 + addonLen;
 
-        if (addrType === 1) address = vlessBuffer.slice(offset, offset + 4).join('.');
-        else if (addrType === 2) {
-            const len = vlessBuffer[offset];
-            address = new TextDecoder().decode(vlessBuffer.slice(offset + 1, offset + 1 + len));
-            offset += 1 + len;
+        if (addrType === 1) { // IPv4
+            address = buf.slice(offset, offset + 4).join('.');
+            offset += 4;
+        } else if (addrType === 2) { // Domain
+            const domainLen = buf[offset];
+            address = new TextDecoder().decode(buf.slice(offset + 1, offset + 1 + domainLen));
+            offset += 1 + domainLen;
+        } else if (addrType === 3) { // IPv6
+            address = Array.from({ length: 8 }, (_, i) => (buf[offset + i * 2] << 8 | buf[offset + i * 2 + 1]).toString(16)).join(':');
+            offset += 16;
         }
-        const rawData = vlessBuffer.slice(offset);
 
-        // --- 核心：Fallback 逻辑 ---
+        const rawData = buf.slice(offset);
+
         try {
-            // 1. 尝试直连
-            console.log(`尝试直连目标: ${address}:${port}`);
+            // 1. 尝试直连 (针对非 CF 保护的 IP)
+            console.log(`尝试直连: ${address}:${port}`);
             remoteSocket = await connect({ hostname: address, port: port });
             await remoteSocket.opened;
-            console.log("直连成功");
-        // ... 前面直连失败后的 catch 逻辑 ...
-} catch (err) {
-    console.log(`直连失败: ${err.message}，尝试通过代理回退...`);
-    try {
-        remoteSocket = await connect({ hostname: PROXY_HOST, port: PROXY_PORT });
-        await remoteSocket.opened;
+            ws.send(new Uint8Array([0, 0])); // 发送 VLESS 成功响应
+        } catch (err) {
+            // 2. 直连失败，回退到 HTTP 代理
+            console.log(`直连失败 (${err.message})，回退到代理: ${PROXY_HOST}`);
+            try {
+                remoteSocket = await connect({ hostname: PROXY_HOST, port: PROXY_PORT });
+                await remoteSocket.opened;
 
-        const writer = remoteSocket.writable.getWriter();
-        const reader = remoteSocket.readable.getReader();
+                const writer = remoteSocket.writable.getWriter();
+                const reader = remoteSocket.readable.getReader();
 
-        // 1. 发送 CONNECT 请求
-        const connectHeader = `CONNECT ${address}:${port} HTTP/1.1\r\nHost: ${address}:${port}\r\n\r\n`;
-        await writer.write(new TextEncoder().encode(connectHeader));
-        writer.releaseLock();
+                // 发送 CONNECT 指令
+                const connectHeader = `CONNECT ${address}:${port} HTTP/1.1\r\nHost: ${address}:${port}\r\n\r\n`;
+                await writer.write(new TextEncoder().encode(connectHeader));
+                writer.releaseLock();
 
-        // 2. 【关键修复】读取并过滤掉代理服务器的 HTTP 200 响应
-        // 代理服务器通常会返回 "HTTP/1.1 200 Connection Established\r\n\r\n"
-        // 我们需要把这段数据从流中读出来，不发给客户端
-        const { value } = await reader.read();
-        const responseText = new TextDecoder().decode(value);
-        console.log(`代理服务器响应: ${responseText.split('\r\n')[0]}`);
-        
-        reader.releaseLock(); // 释放 reader，准备进入 pipeTo
+                // 核心修复：吃掉代理服务器的 HTTP 200 响应，防止 SSL 错误
+                await reader.read(); 
+                reader.releaseLock();
 
-    } catch (proxyErr) {
-        console.log("直连与代理均失败");
-        ws.close();
-        return;
-    }
-}
-// ... 后面发送 rawData 和 pipeTo 的逻辑 ...
+                ws.send(new Uint8Array([0, 0])); // 告诉客户端连接已就绪
+            } catch (proxyErr) {
+                ws.close();
+                return;
+            }
+        }
 
-
-        // 建立双向流
-        ws.send(new Uint8Array([0, 0]));
+        // 发送首包剩余数据
         const writer = remoteSocket.writable.getWriter();
         await writer.write(rawData);
         writer.releaseLock();
 
+        // 双向转发
         remoteSocket.readable.pipeTo(new WritableStream({
             write(chunk) { ws.send(chunk); },
             close() { ws.close(); },
