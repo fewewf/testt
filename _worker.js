@@ -73,28 +73,38 @@ async function handleVLESS(ws) {
             remoteSocket = await connect({ hostname: address, port: port });
             await remoteSocket.opened;
             console.log("直连成功");
-        } catch (err) {
-            // 2. 直连失败，回退到 HTTP 代理
-            console.log(`直连失败: ${err.message}，尝试通过代理回退...`);
-            try {
-                remoteSocket = await connect({ hostname: PROXY_HOST, port: PROXY_PORT });
-                await remoteSocket.opened;
+        // ... 前面直连失败后的 catch 逻辑 ...
+} catch (err) {
+    console.log(`直连失败: ${err.message}，尝试通过代理回退...`);
+    try {
+        remoteSocket = await connect({ hostname: PROXY_HOST, port: PROXY_PORT });
+        await remoteSocket.opened;
 
-                // 构建 HTTP CONNECT 握手包 (这是连接 HTTP 代理的核心)
-                const writer = remoteSocket.writable.getWriter();
-                const connectHeader = `CONNECT ${address}:${port} HTTP/1.1\r\nHost: ${address}:${port}\r\n\r\n`;
-                await writer.write(new TextEncoder().encode(connectHeader));
-                writer.releaseLock();
+        const writer = remoteSocket.writable.getWriter();
+        const reader = remoteSocket.readable.getReader();
 
-                // 简单跳过代理服务器的回应 (HTTP/1.1 200 Connection Established)
-                // 在生产环境中应读取该流，此处为了逻辑简洁略过。
-                console.log("代理连接已发起");
-            } catch (proxyErr) {
-                console.log("直连与代理均失败");
-                ws.close();
-                return;
-            }
-        }
+        // 1. 发送 CONNECT 请求
+        const connectHeader = `CONNECT ${address}:${port} HTTP/1.1\r\nHost: ${address}:${port}\r\n\r\n`;
+        await writer.write(new TextEncoder().encode(connectHeader));
+        writer.releaseLock();
+
+        // 2. 【关键修复】读取并过滤掉代理服务器的 HTTP 200 响应
+        // 代理服务器通常会返回 "HTTP/1.1 200 Connection Established\r\n\r\n"
+        // 我们需要把这段数据从流中读出来，不发给客户端
+        const { value } = await reader.read();
+        const responseText = new TextDecoder().decode(value);
+        console.log(`代理服务器响应: ${responseText.split('\r\n')[0]}`);
+        
+        reader.releaseLock(); // 释放 reader，准备进入 pipeTo
+
+    } catch (proxyErr) {
+        console.log("直连与代理均失败");
+        ws.close();
+        return;
+    }
+}
+// ... 后面发送 rawData 和 pipeTo 的逻辑 ...
+
 
         // 建立双向流
         ws.send(new Uint8Array([0, 0]));
