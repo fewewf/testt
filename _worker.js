@@ -6,15 +6,58 @@ const UUID = '56892533-7dad-475a-b0e8-51040d0d04ad';
 const PROXY_HOST = 'ProxyIP.FR.CMLiussss.net';
 const PROXY_PORT = 443;
 
+// --- 伪装 HTML 页面 (针对爬虫) ---
+const ROBOT_HTML = `
+<!DOCTYPE html>
+<html>
+<head><title>API Documentation Center</title></head>
+<body style="font-family: sans-serif; line-height: 1.6; padding: 20px;">
+    <h1>Enterprise API Gateway - Developer Hub</h1>
+    <p>Welcome to our global edge computing interface. This node provides microservices routing and distributed data synchronization.</p>
+    <h2>Documentation</h2>
+    <ul>
+        <li>Core Authentication Protocol v3.2</li>
+        <li>Edge Function Deployment Guidelines</li>
+        <li>Global Latency Monitoring API</li>
+    </ul>
+    <footer style="margin-top: 50px; color: #888;">&copy; 2026 EdgeConnect Global Network</footer>
+</body>
+</html>`;
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
-    if (url.pathname !== SECRET_PATH) return new Response('Not Found', { status: 404 });
-    if (request.headers.get('Upgrade') !== 'websocket') return new Response('Unauthorized', { status: 401 });
+    const ua = request.headers.get('User-Agent') || '';
+
+    // 1. 路径不匹配时的伪装逻辑
+    if (url.pathname !== SECRET_PATH) {
+      // 如果是爬虫访问，返回 HTML 页面进行 SEO 伪装
+      if (ua.toLowerCase().includes('bot') || ua.toLowerCase().includes('spider')) {
+        return new Response(ROBOT_HTML, {
+          headers: { "Content-Type": "text/html; charset=UTF-8" }
+        });
+      }
+      // 否则返回 API 模拟数据
+      return new Response(JSON.stringify({
+        status: "active",
+        node: "edge-service-2026",
+        message: "API endpoint is online"
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // 2. 匹配路径但非 WebSocket (伪装成 405 Method Not Allowed)
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response(JSON.stringify({ error: "Forbidden", message: "Invalid session" }), { 
+        status: 403, 
+        headers: { "Content-Type": "application/json" }
+      });
+    }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-
     server.accept();
     handleVLESS(server);
 
@@ -30,7 +73,6 @@ async function handleVLESS(ws) {
 
   ws.binaryType = "arraybuffer";
 
-  // 清理函数：确保连接关闭时释放所有资源
   const closeAll = () => {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     if (remoteSocket) remoteSocket.close();
@@ -40,9 +82,8 @@ async function handleVLESS(ws) {
   ws.addEventListener('message', async (event) => {
     try {
       const buf = new Uint8Array(event.data);
-
       if (!remoteSocket) {
-        // --- VLESS 协议解析 ---
+        // --- VLESS 握手与地址解析 ---
         if (buf.length < 24) return ws.close();
         const clientUUID = Array.from(buf.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
         if (clientUUID !== cleanUUID) return ws.close();
@@ -72,26 +113,19 @@ async function handleVLESS(ws) {
         const dataToForward = buf.slice(cursor);
         remoteSocket = await connectWithFallback(address, port, PROXY_HOST, PROXY_PORT);
         writer = remoteSocket.writable.getWriter();
-        
         ws.send(new Uint8Array([0, 0])); 
 
-        // --- 启动保活心跳 (每 30 秒发送一次微小数据) ---
+        // --- 保活与背压优化 ---
+        // 使用抖动的心跳时间 (25s-35s) 增加行为随机性
+        const jitter = 25000 + Math.random() * 10000;
         keepAliveTimer = setInterval(() => {
-          if (ws.readyState === 1) {
-            // 发送空的逻辑心跳或极小数据包
-            ws.send(new Uint8Array(0)); 
-          }
-        }, 30000);
+          if (ws.readyState === 1) ws.send(new Uint8Array(0)); 
+        }, jitter);
 
-        // --- 管道转发 (带大文件优化) ---
         pipeTCP2WS(ws, remoteSocket);
-
-        if (dataToForward.length > 0) {
-          await writer.write(dataToForward);
-        }
+        if (dataToForward.length > 0) await writer.write(dataToForward);
         return;
       }
-
       await writer.write(buf);
     } catch (err) {
       closeAll();
@@ -114,33 +148,22 @@ async function connectWithFallback(address, port, proxyHost, proxyPort) {
   }
 }
 
-/**
- * 针对大文件下载极致优化的管道函数
- */
 async function pipeTCP2WS(ws, socket) {
   const reader = socket.readable.getReader();
-  
   try {
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
-      if (ws.readyState !== 1) break;
+      if (done || ws.readyState !== 1) break;
 
-      // --- 背压机制：防止大文件下载撑爆 Worker 内存 ---
-      // 如果客户端接收太慢，积压超过 512KB 时暂停读取 TCP
+      // 大文件背压优化：512KB 水位线
       if (ws.bufferedAmount > 512 * 1024) {
-        let waitCount = 0;
-        while (ws.bufferedAmount > 256 * 1024 && waitCount < 100) {
+        while (ws.bufferedAmount > 256 * 1024 && ws.readyState === 1) {
           await new Promise(r => setTimeout(r, 100));
-          waitCount++;
-          if (ws.readyState !== 1) break;
         }
       }
-
       ws.send(value);
     }
   } catch (err) {
-    // 错误处理逻辑
   } finally {
     reader.releaseLock();
     if (ws.readyState === 1) ws.close();
