@@ -228,20 +228,16 @@ function pipeTCP2WS(ws, socket) {
 
 function pipeWS2TCP(ws, socket) {
 
-  const writer = socket.writable.getWriter();
-
   ws.addEventListener("message", async (event) => {
     try {
       if (ws.readyState !== 1) return;
 
+      const writer = socket.writable.getWriter();
       await writer.write(new Uint8Array(event.data));
+      writer.releaseLock();
+
     } catch {
-      try { writer.close(); } catch {}
       ws.close();
     }
-  });
-
-  ws.addEventListener("close", () => {
-    try { writer.close(); } catch {}
   });
 }
