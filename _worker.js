@@ -134,33 +134,99 @@ async function handleVLESS(ws) {
 /* -------------------------- */
 
 async function connectRemote(address, port) {
+  // ---------- 1. 先尝试直连 ----------
   try {
     const socket = connect({ hostname: address, port });
     await socket.opened;
     return socket;
-  } catch {
+  } catch {}
 
-    // fallback proxy
-    const socket = connect({
-      hostname: PROXY_HOST,
-      port: PROXY_PORT,
+  // ---------- 2. fallback CONNECT ----------
+  const socket = connect({
+    hostname: PROXY_HOST,
+    port: PROXY_PORT,
+  });
+
+  await socket.opened;
+
+  const writer = socket.writable.getWriter();
+  const reader = socket.readable.getReader();
+
+  await writer.write(
+    new TextEncoder().encode(
+      `CONNECT ${address}:${port} HTTP/1.1\r\n` +
+      `Host: ${address}:${port}\r\n` +
+      `Proxy-Connection: Keep-Alive\r\n\r\n`
+    )
+  );
+
+  writer.releaseLock();
+
+  // ===== 精确读取 CONNECT 响应 =====
+  const decoder = new TextDecoder();
+
+  let chunks = [];
+  let total = 0;
+  let headerEnd = -1;
+
+  while (headerEnd === -1) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error("proxy closed");
+
+    chunks.push(value);
+    total += value.length;
+
+    const merged = concatChunks(chunks, total);
+    const text = decoder.decode(merged);
+
+    headerEnd = text.indexOf("\r\n\r\n");
+
+    if (total > 8192)
+      throw new Error("CONNECT header too large");
+  }
+
+  const merged = concatChunks(chunks, total);
+  const headerText = decoder.decode(
+    merged.slice(0, headerEnd + 4)
+  );
+
+  if (!headerText.startsWith("HTTP/1.1 200"))
+    throw new Error("CONNECT failed");
+
+  // ⭐ 关键：保留 TLS 剩余数据
+  const remain = merged.slice(headerEnd + 4);
+
+  reader.releaseLock();
+
+  // 如果 TLS 已经到达，重新注入 stream
+  if (remain.length > 0) {
+    const inject = new ReadableStream({
+      start(controller) {
+        controller.enqueue(remain);
+        socket.readable.pipeTo(
+          new WritableStream({
+            write(c) { controller.enqueue(c); },
+            close() { controller.close(); }
+          })
+        );
+      }
     });
 
-    await socket.opened;
-
-    const writer = socket.writable.getWriter();
-
-    await writer.write(
-      new TextEncoder().encode(
-        `CONNECT ${address}:${port} HTTP/1.1\r\nHost: ${address}\r\n\r\n`
-      )
-    );
-
-    writer.releaseLock();
-    return socket;
+    socket.readable = inject;
   }
+
+  return socket;
 }
 
+function concatChunks(chunks, total) {
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    buf.set(c, offset);
+    offset += c.length;
+  }
+  return buf;
+}
 /* -------------------------- */
 /*       Stream Pipes         */
 /* -------------------------- */
