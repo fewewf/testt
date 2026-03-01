@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets';
 
 const SECRET_PATH = '/tunnel-vip-2026/auth-888999';
 const UUID = '56892533-7dad-475a-b0e8-51040d0d04ad';
-const PROXY_HOST = 'yx1.98981.xyz';
+const PROXY_HOST = 'yx1.9898981.xyz';
 const PROXY_PORT = 8443;
 
 export default {
