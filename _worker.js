@@ -98,8 +98,18 @@ async function connectRemote(address, port) {
     const pWriter = socket.writable.getWriter();
     const pReader = socket.readable.getReader();
 
-    const hello = `CONNECT ${address}:${port} HTTP/1.1\r\nHost: ${address}:${port}\r\n\r\n`;
-    await pWriter.write(new TextEncoder().encode(hello));
+    // 修改后的握手构造
+    const hello = [
+  `CONNECT ${address}:${port} HTTP/1.1`,
+  `Host: ${address}:${port}`,
+  `Proxy-Connection: Keep-Alive`,
+  `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0`,
+  `Connection: Keep-Alive`,
+  '\r\n' // 结尾必须有额外的换行
+   ].join('\r\n');
+
+ await pWriter.write(new TextEncoder().encode(hello));
+ await pWriter.write(new TextEncoder().encode(hello));
     pWriter.releaseLock();
 
     let buf = new Uint8Array(0);
