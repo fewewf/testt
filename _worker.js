@@ -93,13 +93,16 @@ async function handleVLESS(ws) {
         const rawData = buf.slice(cursor);
 
         // ===== 建立远程连接 =====
-        remoteSocket = await connectRemote(address, port);
-
+        const result = await connectRemote(address, port);
+remoteSocket = result.socket;
         // VLESS OK 响应
         ws.send(new Uint8Array([0, 0]));
 
         // WS → TCP
         pipeWS2TCP(ws, remoteSocket);
+        if (result.leftover && result.leftover.length) {
+    ws.send(result.leftover);
+}
 
         // TCP → WS
         pipeTCP2WS(ws, remoteSocket);
@@ -134,14 +137,15 @@ async function handleVLESS(ws) {
 /* -------------------------- */
 
 async function connectRemote(address, port) {
-  // ---------- 1. 先尝试直连 ----------
+
+  // ---------- 直连 ----------
   try {
     const socket = connect({ hostname: address, port });
     await socket.opened;
-    return socket;
+    return { socket, leftover: null };
   } catch {}
 
-  // ---------- 2. fallback CONNECT ----------
+  // ---------- fallback ----------
   const socket = connect({
     hostname: PROXY_HOST,
     port: PROXY_PORT,
@@ -155,67 +159,45 @@ async function connectRemote(address, port) {
   await writer.write(
     new TextEncoder().encode(
       `CONNECT ${address}:${port} HTTP/1.1\r\n` +
-      `Host: ${address}:${port}\r\n` +
-      `Proxy-Connection: Keep-Alive\r\n\r\n`
+      `Host: ${address}:${port}\r\n\r\n`
     )
   );
 
   writer.releaseLock();
 
-  // ===== 精确读取 CONNECT 响应 =====
   const decoder = new TextDecoder();
 
-  let chunks = [];
-  let total = 0;
-  let headerEnd = -1;
+  let buf = new Uint8Array(0);
 
-  while (headerEnd === -1) {
+  while (true) {
     const { value, done } = await reader.read();
     if (done) throw new Error("proxy closed");
 
-    chunks.push(value);
-    total += value.length;
+    buf = concat(buf, value);
 
-    const merged = concatChunks(chunks, total);
-    const text = decoder.decode(merged);
+    const text = decoder.decode(buf);
+    const idx = text.indexOf("\r\n\r\n");
 
-    headerEnd = text.indexOf("\r\n\r\n");
+    if (idx !== -1) {
 
-    if (total > 8192)
-      throw new Error("CONNECT header too large");
+      if (!text.startsWith("HTTP/1.1 200"))
+        throw new Error("CONNECT failed");
+
+      const remain = buf.slice(idx + 4);
+
+      reader.releaseLock();
+
+      // ⭐ 返回 leftover，不修改 stream
+      return { socket, leftover: remain };
+    }
   }
+}
 
-  const merged = concatChunks(chunks, total);
-  const headerText = decoder.decode(
-    merged.slice(0, headerEnd + 4)
-  );
-
-  if (!headerText.startsWith("HTTP/1.1 200"))
-    throw new Error("CONNECT failed");
-
-  // ⭐ 关键：保留 TLS 剩余数据
-  const remain = merged.slice(headerEnd + 4);
-
-  reader.releaseLock();
-
-  // 如果 TLS 已经到达，重新注入 stream
-  if (remain.length > 0) {
-    const inject = new ReadableStream({
-      start(controller) {
-        controller.enqueue(remain);
-        socket.readable.pipeTo(
-          new WritableStream({
-            write(c) { controller.enqueue(c); },
-            close() { controller.close(); }
-          })
-        );
-      }
-    });
-
-    socket.readable = inject;
-  }
-
-  return socket;
+function concat(a, b) {
+  const c = new Uint8Array(a.length + b.length);
+  c.set(a);
+  c.set(b, a.length);
+  return c;
 }
 
 function concatChunks(chunks, total) {
