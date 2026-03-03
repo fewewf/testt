@@ -1,66 +1,37 @@
 import { connect } from 'cloudflare:sockets';
 
-// --- [配置区] ---
+// --- [核心配置] ---
 const SECRET_PATH = '/tunnel-vip-2026/auth-888999';
 const FIXED_UUID = '56892533-7dad-475a-b0e8-51040d0d04ad';
 const PROXY_IP = 'ProxyIP.FR.CMLiussss.net'; 
 const PROXY_PORT = 443;
 
-// --- [伪装内容] ---
-const ROBOT_HTML = `<!DOCTYPE html><html><head><title>Technical Documentation</title></head><body style="font-family:sans-serif;padding:40px;"><h1>Edge Service Documentation</h1><p>Welcome to the global edge network node. This endpoint is reserved for internal microservices.</p></body></html>`;
-const MOCK_API = { status: "success", node: "cf-edge-node", uptime: "99.99%", services: "online" };
+// --- [伪装配置] ---
+const ROBOT_HTML = `<!DOCTYPE html><html><head><title>404 Not Found</title></head><body style="padding:50px;"><h1>404 Not Found</h1><p>The resource could not be found.</p></body></html>`;
 
-// --- [常量定义] ---
 const WS_READY_STATE_OPEN = 1;
 
 export default {
     async fetch(request) {
-        try {
-            const url = new URL(request.url);
-            const ua = request.headers.get('User-Agent') || '';
-
-            // 1. 路径与伪装逻辑 (防探测)
-            if (url.pathname !== SECRET_PATH) {
-                if (ua.toLowerCase().includes('bot') || ua.toLowerCase().includes('spider')) {
-                    return new Response(ROBOT_HTML, { headers: { "Content-Type": "text/html" } });
-                }
-                return new Response(JSON.stringify(MOCK_API), { status: 200, headers: { "Content-Type": "application/json" } });
-            }
-
-            // 2. 检查 WebSocket 升级
-            if (request.headers.get('Upgrade') !== 'websocket') {
-                return new Response('Hello World!', { status: 200 });
-            }
-
-            // 3. 进入核心 VLESS 逻辑
-            return await handleVLESSWebSocket(request);
-        } catch (err) {
-            return new Response(err.stack, { status: 500 });
+        const url = new URL(request.url);
+        // 1. 路径验证与伪装
+        if (url.pathname !== SECRET_PATH) {
+            return new Response(ROBOT_HTML, { status: 404, headers: { 'Content-Type': 'text/html' } });
         }
+
+        if (request.headers.get('Upgrade') !== 'websocket') {
+            return new Response('System Online', { status: 200 });
+        }
+
+        return await handleVLESS(request);
     }
 };
 
-async function handleVLESSWebSocket(request) {
+async function handleVLESS(request) {
     const wsPair = new WebSocketPair();
     const [clientWS, serverWS] = Object.values(wsPair);
     serverWS.accept();
 
-    // 心跳保活 (保持长连接)
-    let heartbeat = setInterval(() => {
-        if (serverWS.readyState === WS_READY_STATE_OPEN) {
-            try { serverWS.send(new Uint8Array(0)); } catch (e) {}
-        }
-    }, 30000);
-
-    const closeAll = () => {
-        clearInterval(heartbeat);
-        if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.close();
-    };
-
-    serverWS.addEventListener('close', closeAll);
-    serverWS.addEventListener('error', closeAll);
-
-    // 协议流处理
     const wsReadable = createWebSocketReadableStream(serverWS);
     let remoteSocket = null;
 
@@ -73,95 +44,95 @@ async function handleVLESSWebSocket(request) {
                 return;
             }
 
-            // 解析 VLESS 头部
             const result = parseVLESSHeader(chunk);
             if (result.hasError) throw new Error(result.message);
 
-            const vlessRespHeader = new Uint8Array([result.vlessVersion[0], 0]);
-            const rawClientData = chunk.slice(result.rawDataIndex);
+            const vlessHeader = new Uint8Array([result.vlessVersion[0], 0]);
+            const clientData = chunk.slice(result.rawDataIndex);
 
-            // 建立连接 (参考正常代码的重试逻辑思想)
-            try {
-                // 优先尝试通过反代连接 (解决 YouTube/Google 等 SSL 协议报错)
-                remoteSocket = await connect({ hostname: PROXY_IP, port: PROXY_PORT }, { allowHalfOpen: true });
-                const writer = remoteSocket.writable.getWriter();
-                await writer.write(rawClientData);
-                writer.releaseLock();
+            // --- [Fallback 核心逻辑] ---
+            remoteSocket = await connectWithFallback(result.addressRemote, result.portRemote);
+            
+            const writer = remoteSocket.writable.getWriter();
+            await writer.write(clientData);
+            writer.releaseLock();
 
-                // 启动关键的高性能管道 (移植了正常代码的分片逻辑)
-                pipeRemoteToWebSocket(remoteSocket, serverWS, vlessRespHeader);
-            } catch (err) {
-                if (serverWS.readyState === WS_READY_STATE_OPEN) {
-                    serverWS.close(1011, 'Connection failed: ' + err.message);
-                }
-            }
-        },
-        close() { if (remoteSocket) remoteSocket.close(); }
+            // 启动高性能双向管道
+            pipeRemoteToWebSocket(remoteSocket, serverWS, vlessHeader);
+        }
     })).catch(err => {
-        console.error("Pipeline Error:", err);
-        closeAll();
+        if (serverWS.readyState === WS_READY_STATE_OPEN) serverWS.close();
     });
 
     return new Response(null, { status: 101, webSocket: clientWS });
 }
 
 /**
- * 核心移植：高性能分片与缓存刷新管道
- * 这是解决 YouTube SSL 报错的关键
+ * 传统的 Fallback 机制：直连失败后回退到 ProxyIP
+ */
+async function connectWithFallback(address, port) {
+    try {
+        // 1. 尝试直连 (承载大流量，如 YouTube 直连成功则速度极快)
+        const socket = connect({ hostname: address, port: port }, { allowHalfOpen: true });
+        await socket.opened;
+        console.log(`Direct connect to ${address} success`);
+        return socket;
+    } catch (e) {
+        // 2. 如果直连失败 (ERR_SSL_PROTOCOL_ERROR 等情况触发的连接中断)
+        console.warn(`Direct connect to ${address} failed, falling back to ProxyIP`);
+        
+        const proxySocket = connect({ hostname: PROXY_IP, port: PROXY_PORT }, { allowHalfOpen: true });
+        await proxySocket.opened;
+        return proxySocket;
+    }
+}
+
+/**
+ * 高性能管道：移植“正常代码”的分片与快速刷新逻辑
  */
 async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader) {
-    const MAX_CHUNK_SIZE = 128 * 1024; // 128 KB 分帧
-    const MAX_BUFFER_SIZE = 2 * 1024 * 1024; // 2 MB 强刷
-    const FLUSH_INTERVAL = 10; // 10ms 定期刷新
-
+    const reader = remoteSocket.readable.getReader();
     let headerSent = false;
     let bufferQueue = [];
-    let bufferedBytes = 0;
-
-    const concatChunks = (chunks) => {
-        const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-        const merged = new Uint8Array(total);
-        let offset = 0;
-        for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
-        return merged;
-    };
 
     const flush = () => {
         if (ws.readyState !== WS_READY_STATE_OPEN || bufferQueue.length === 0) return;
-        const merged = concatChunks(bufferQueue);
-        bufferQueue = [];
-        bufferedBytes = 0;
-
-        // 分包发送，防止 WebSocket 帧过载
+        const total = bufferQueue.reduce((s, c) => s + c.byteLength, 0);
+        const merged = new Uint8Array(total);
         let offset = 0;
-        while (offset < merged.byteLength) {
-            const end = Math.min(offset + MAX_CHUNK_SIZE, merged.byteLength);
-            ws.send(merged.slice(offset, end));
-            offset = end;
+        for (const c of bufferQueue) {
+            merged.set(c, offset);
+            offset += c.byteLength;
+        }
+        bufferQueue = [];
+        
+        // 分片发送，确保浏览器 SSL 握手不卡顿
+        let i = 0;
+        const CHUNK_SIZE = 128 * 1024;
+        while (i < merged.byteLength) {
+            ws.send(merged.slice(i, i + CHUNK_SIZE));
+            i += CHUNK_SIZE;
         }
     };
 
-    const flushTimer = setInterval(flush, FLUSH_INTERVAL);
-    const reader = remoteSocket.readable.getReader();
+    const flushTimer = setInterval(flush, 15); // 15ms 快速刷新
 
     try {
         while (true) {
             const { done, value } = await reader.read();
-            if (done || ws.readyState !== WS_READY_STATE_OPEN) break;
+            if (done) break;
+            if (ws.readyState !== WS_READY_STATE_OPEN) break;
 
             if (!headerSent) {
                 const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
                 combined.set(vlessHeader, 0);
                 combined.set(value, vlessHeader.byteLength);
                 bufferQueue.push(combined);
-                bufferedBytes += combined.byteLength;
                 headerSent = true;
             } else {
                 bufferQueue.push(value);
-                bufferedBytes += value.byteLength;
             }
-
-            if (bufferedBytes >= MAX_BUFFER_SIZE) flush();
+            if (bufferQueue.length > 30) flush(); 
         }
     } finally {
         clearInterval(flushTimer);
@@ -171,6 +142,7 @@ async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader) {
     }
 }
 
+// --- [辅助函数] ---
 function createWebSocketReadableStream(ws) {
     return new ReadableStream({
         start(controller) {
@@ -182,7 +154,6 @@ function createWebSocketReadableStream(ws) {
 }
 
 function parseVLESSHeader(buffer) {
-    if (buffer.byteLength < 24) return { hasError: true, message: 'Invalid Header' };
     const view = new DataView(buffer.buffer);
     const uuid = Array.from(new Uint8Array(buffer.slice(1, 17))).map(b => b.toString(16).padStart(2, '0')).join('');
     const cleanUUID = FIXED_UUID.replace(/-/g, '');
