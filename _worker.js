@@ -1,53 +1,56 @@
 import { connect } from 'cloudflare:sockets';
 
-// --- 配置区 ---
+// ===== 配置区 =====
 const SECRET_PATH = '/tunnel-vip-2026/auth-888999';
 const UUID = '56892533-7dad-475a-b0e8-51040d0d04ad';
 const PROXY_HOST = 'ProxyIP.FR.CMLiussss.net';
 const PROXY_PORT = 443;
 
-// --- 伪装内容 ---
-const ROBOT_HTML = `<!DOCTYPE html><html><head><title>Technical Documentation</title></head><body style="font-family:sans-serif;padding:40px;"><h1>Edge Service Documentation</h1><p>Welcome to the global edge network node. This endpoint is reserved for internal microservices.</p></body></html>`;
-const MOCK_API = { status: "success", node: "cf-edge-node", uptime: "99.99%", services: "online" };
+const CONNECT_TIMEOUT = 10000;
+const FIRST_PACKET_TIMEOUT = 3000;
+const MAX_RETRY = 4;
+const BASE_DELAY = 300;
+const MAX_CHUNK = 64 * 1024; // 64KB
+
+// ===== 伪装 =====
+const ROBOT_HTML = `<!DOCTYPE html><html><head><title>Edge Node</title></head><body><h1>Edge Service</h1></body></html>`;
+const MOCK_API = { status: "ok", node: "cf-edge" };
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     const ua = request.headers.get('User-Agent') || '';
 
-    // 1. 路径与伪装逻辑
     if (url.pathname !== SECRET_PATH) {
-      if (ua.toLowerCase().includes('bot') || ua.toLowerCase().includes('spider')) {
+      if (ua.toLowerCase().includes('bot')) {
         return new Response(ROBOT_HTML, { headers: { "Content-Type": "text/html" } });
       }
       return new Response(JSON.stringify(MOCK_API), { headers: { "Content-Type": "application/json" } });
     }
 
-    // 2. 检查 WebSocket 协议
     if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response(JSON.stringify({ error: "Unauthorized", code: 401 }), { status: 401 });
+      return new Response('Unauthorized', { status: 401 });
     }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
 
-    // 启动处理逻辑
     handleVLESS(server);
 
     return new Response(null, { status: 101, webSocket: client });
   }
 };
 
+// ================= 主逻辑 =================
+
 async function handleVLESS(ws) {
   const cleanUUID = UUID.replace(/-/g, '');
   let remoteSocket = null;
   let writer = null;
-  let keepAliveTimer = null;
 
   const closeAll = () => {
-    if (keepAliveTimer) clearInterval(keepAliveTimer);
-    if (remoteSocket) remoteSocket.close();
+    try { if (remoteSocket) remoteSocket.close(); } catch {}
     if (ws.readyState === 1) ws.close();
   };
 
@@ -56,58 +59,69 @@ async function handleVLESS(ws) {
       const buf = new Uint8Array(event.data);
 
       if (!remoteSocket) {
-        // --- VLESS 协议解析 ---
         if (buf.length < 24) return closeAll();
-        const clientUUID = Array.from(buf.slice(1, 17)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+        const clientUUID = Array.from(buf.slice(1, 17))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('');
+
         if (clientUUID !== cleanUUID) return closeAll();
 
         let cursor = 18 + buf[17];
-        const command = buf[cursor++]; 
-        if (command !== 1) return closeAll(); // 仅支持 TCP
+        const command = buf[cursor++];
+        if (command !== 1) return closeAll();
 
         const port = (buf[cursor] << 8) | buf[cursor + 1];
         cursor += 2;
+
         const addrType = buf[cursor++];
         let address = '';
 
-        if (addrType === 1) address = buf.slice(cursor, cursor + 4).join('.');
-        else if (addrType === 2) {
+        if (addrType === 1) {
+          address = buf.slice(cursor, cursor + 4).join('.');
+        } else if (addrType === 2) {
           const len = buf[cursor];
           address = new TextDecoder().decode(buf.slice(cursor + 1, cursor + 1 + len));
-          cursor += 1 + len;
         } else if (addrType === 3) {
-          address = Array.from({length:8}, (_,i)=>((buf[cursor+i*2]<<8)|buf[cursor+i*2+1]).toString(16)).join(':');
-          cursor += 16;
+          address = Array.from({ length: 8 }, (_, i) =>
+            ((buf[cursor + i * 2] << 8) | buf[cursor + i * 2 + 1]).toString(16)
+          ).join(':');
         }
 
-        const dataToForward = buf.slice(cursor);
+        const dataToForward = buf.slice(buf.length - (buf.length - cursor));
 
-        // --- 建立连接 (带超时保护) ---
-        remoteSocket = await Promise.race([
-          connectWithFallback(address, port),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Connect Timeout')), 10000))
-        ]);
+        const retryConnect = async (retryCount = 0) => {
+          if (retryCount > MAX_RETRY) return closeAll();
 
-        writer = remoteSocket.writable.getWriter();
-        ws.send(new Uint8Array([0, 0])); 
+          try {
+            remoteSocket = await connectWithFallback(address, port, retryCount);
+            writer = remoteSocket.writable.getWriter();
 
-        // 启动保活 (带抖动)
-        keepAliveTimer = setInterval(() => {
-          if (ws.readyState === 1) ws.send(new Uint8Array(0));
-        }, 30000 + Math.random() * 5000);
+            pipeTCP2WS(ws, remoteSocket, retryConnect, retryCount);
 
-        // 启动管道
-        pipeTCP2WS(ws, remoteSocket);
+            if (dataToForward.length > 0)
+              await writer.write(dataToForward);
 
-        if (dataToForward.length > 0) await writer.write(dataToForward);
+          } catch {
+            const delay = BASE_DELAY * Math.pow(2, retryCount);
+            await new Promise(r => setTimeout(r, delay));
+            await retryConnect(retryCount + 1);
+          }
+        };
+
+        await retryConnect();
         return;
       }
 
-      // 后续数据
-      await writer.write(buf);
+      if (writer) {
+        try {
+          await writer.write(buf);
+        } catch {
+          closeAll();
+        }
+      }
 
-    } catch (err) {
-      console.error(`[Fatal] ${err.message}`);
+    } catch {
       closeAll();
     }
   });
@@ -116,47 +130,67 @@ async function handleVLESS(ws) {
   ws.addEventListener('error', closeAll);
 }
 
-async function connectWithFallback(address, port) {
+// ================= 连接逻辑 =================
+
+async function connectWithFallback(address, port, retryCount) {
   try {
-    const socket = connect({ hostname: address, port });
-    await socket.opened;
+    const socket = connect(
+      { hostname: address, port },
+      { allowHalfOpen: true }
+    );
+
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Connect Timeout')), CONNECT_TIMEOUT)
+      )
+    ]);
+
     return socket;
-  } catch (e) {
-    // 触发 Fallback
-    const socket = connect({ hostname: PROXY_HOST, port: PROXY_PORT });
+
+  } catch {
+    if (retryCount >= MAX_RETRY) throw new Error('Connect failed');
+
+    const socket = connect(
+      { hostname: PROXY_HOST, port: PROXY_PORT },
+      { allowHalfOpen: true }
+    );
+
     await socket.opened;
     return socket;
   }
 }
 
-/**
- * 核心稳定版管道：彻底修复 Hang 报错
- */
-async function pipeTCP2WS(ws, socket) {
+// ================= 数据管道 =================
+
+async function pipeTCP2WS(ws, socket, retryFn, retryCount) {
   const reader = socket.readable.getReader();
+
+  let firstPacketReceived = false;
+
+  const firstPacketTimer = setTimeout(async () => {
+    if (!firstPacketReceived) {
+      try { socket.close(); } catch {}
+      await retryFn(retryCount + 1);
+    }
+  }, FIRST_PACKET_TIMEOUT);
+
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done || ws.readyState !== 1) break;
 
-      // --- 背压逃逸控制 ---
-      if (ws.bufferedAmount > 1024 * 1024) { // 提高到 1MB 阈值
-        let safetyCounter = 0;
-        // 最多等待 5 秒，超过则强制继续或跳出，防止 Worker 被判定为 Hang
-        while (ws.bufferedAmount > 256 * 1024 && ws.readyState === 1 && safetyCounter < 50) {
-          await new Promise(r => setTimeout(r, 100));
-          safetyCounter++;
-        }
-        if (safetyCounter >= 50) {
-          console.warn("Buffer clear timeout - safety break triggered");
-          break; 
-        }
-      }
+      firstPacketReceived = true;
+      clearTimeout(firstPacketTimer);
 
-      ws.send(value);
+      let offset = 0;
+      while (offset < value.length) {
+        ws.send(value.slice(offset, offset + MAX_CHUNK));
+        offset += MAX_CHUNK;
+      }
     }
-  } catch (e) {
-    console.error(`Pipe error: ${e.message}`);
+  } catch {
+    await retryFn(retryCount + 1);
   } finally {
     reader.releaseLock();
     if (ws.readyState === 1) ws.close();
