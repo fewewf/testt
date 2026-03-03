@@ -93,29 +93,6 @@ async function connectWithFallback(address, port) {
 async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader) {
     const reader = remoteSocket.readable.getReader();
     let headerSent = false;
-    let bufferQueue = [];
-
-    const flush = () => {
-        if (ws.readyState !== WS_READY_STATE_OPEN || bufferQueue.length === 0) return;
-        const total = bufferQueue.reduce((s, c) => s + c.byteLength, 0);
-        const merged = new Uint8Array(total);
-        let offset = 0;
-        for (const c of bufferQueue) {
-            merged.set(c, offset);
-            offset += c.byteLength;
-        }
-        bufferQueue = [];
-        
-        // 分片发送，确保浏览器 SSL 握手不卡顿
-        let i = 0;
-        const CHUNK_SIZE = 128 * 1024;
-        while (i < merged.byteLength) {
-            ws.send(merged.slice(i, i + CHUNK_SIZE));
-            i += CHUNK_SIZE;
-        }
-    };
-
-    const flushTimer = setInterval(flush, 15); // 15ms 快速刷新
 
     try {
         while (true) {
@@ -124,19 +101,23 @@ async function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader) {
             if (ws.readyState !== WS_READY_STATE_OPEN) break;
 
             if (!headerSent) {
-                const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
-                combined.set(vlessHeader, 0);
-                combined.set(value, vlessHeader.byteLength);
-                bufferQueue.push(combined);
+                // --- 终极修复逻辑 ---
+                // 1. 先只发送 VLESS 响应头 [0, 0]
+                ws.send(vlessHeader);
+                
+                // 2. 紧接着发送真正的远程数据 (第一个 TLS 握手包)
+                // 不合并，直接发送 value
+                ws.send(value);
+                
                 headerSent = true;
             } else {
-                bufferQueue.push(value);
+                // 后续数据直接透传，不再进入任何 bufferQueue 延迟
+                ws.send(value);
             }
-            if (bufferQueue.length > 30) flush(); 
         }
+    } catch (e) {
+        // 忽略流关闭异常
     } finally {
-        clearInterval(flushTimer);
-        flush();
         reader.releaseLock();
         if (ws.readyState === WS_READY_STATE_OPEN) ws.close();
     }
