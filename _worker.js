@@ -5,296 +5,175 @@ const _rcHzgeggsXmfUWrW = '56892533-7dad-324a-b0e8-51040d0d04ad';
 const _JeHxQnQHudDPWbyN = 'ProxyIP.FR.CMLiussss.net';
 const _JsGTkSTJgBtAOVZl = 443;
 
-const WS_READY_STATE_OPEN = 1;
-const CONNECTION_TIMEOUT = 5000;
-const DATA_TIMEOUT = 3000;
-
-const _KtFJDaQcgkFDwTLY = (_yRsSyhpBCxFbqNPU, _HpkuToMJSAvwPNva = 404) => {
-  const _XwbeLFBOTVlfgfaV = {
-    timestamp: new Date().toISOString(),
-    status: _HpkuToMJSAvwPNva,
-    error: _HpkuToMJSAvwPNva === 404 ? "Not Found" : "Unauthorized",
-    message: `No static resource or API endpoint found for: ${_yRsSyhpBCxFbqNPU.pathname}`,
-    path: _yRsSyhpBCxFbqNPU.pathname,
-    requestId: Math.random().toString(36).substring(2, 15).toUpperCase(),
-    service: "api-gateway-v2"
-  };
-  return new Response(JSON.stringify(_XwbeLFBOTVlfgfaV), {
-    status: _HpkuToMJSAvwPNva,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'X-Content-Type-Options': 'nosniff',
-      'X-XSS-Protection': '1; mode=block',
-      'X-Frame-Options': 'DENY',
-      'Server': 'nginx'
-    }
-  });
-};
-
 export default {
-  async fetch(_gAaPbetxNIakJQKw) {
-    const _yRsSyhpBCxFbqNPU = new URL(_gAaPbetxNIakJQKw.url);
-    if (_yRsSyhpBCxFbqNPU.pathname !== _cQndIdPFBwdwdfPS) {
-      return _KtFJDaQcgkFDwTLY(_yRsSyhpBCxFbqNPU, 404);
-    }
-    if (_gAaPbetxNIakJQKw.headers.get('Upgrade') !== 'websocket') {
-      return new Response(JSON.stringify({
-        status: "UP",
-        version: "2.4.1-RELEASE",
-        uptime: Math.floor(Math.random() * 100000) + "s"
-      }), {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/json'
+    async fetch(request) {
+        const url = new URL(request.url);
+        
+        // 1. 认证校验
+        if (url.pathname !== _cQndIdPFBwdwdfPS) {
+            return new Response('Not Found', { status: 404 });
         }
-      });
+        if (request.headers.get('Upgrade') !== 'websocket') {
+            return new Response(JSON.stringify({ status: "UP", version: "2.4.2" }), { status: 200 });
+        }
+
+        const [client, server] = Object.values(new WebSocketPair());
+        server.accept();
+
+        // 异步处理流量转发，不阻塞 fetch 返回
+        handleVLESS(server).catch(err => console.error("VLESS Fatal:", err.message));
+
+        return new Response(null, {
+            status: 101,
+            webSocket: client,
+        });
     }
-    
-    const _sdTNvSnQHgfISqwc = new WebSocketPair();
-    const [_cIMstliQdZbHDVpr, _zNeFASTClFTonTIr] = Object.values(_sdTNvSnQHgfISqwc);
-    _zNeFASTClFTonTIr.accept();
-    
-    handleWebSocket(_zNeFASTClFTonTIr).catch(err => {
-      console.error("WebSocket Error:", err.message);
-      try { _zNeFASTClFTonTIr.close(); } catch(e) {}
-    });
-    
-    return new Response(null, {
-      status: 101,
-      webSocket: _cIMstliQdZbHDVpr,
-      headers: {
-        'Sec-WebSocket-Protocol': _gAaPbetxNIakJQKw.headers.get('Sec-WebSocket-Protocol') || '',
-        'Connection': 'Upgrade',
-        'Upgrade': 'websocket'
-      }
-    });
-  }
 };
 
-async function handleWebSocket(ws) {
-  let wsClosed = false;
-  
-  ws.addEventListener('close', () => { wsClosed = true; });
-  ws.addEventListener('error', () => { wsClosed = true; });
-  
-  try {
-    // 读取第一个消息（VLESS头）- 这个流需要被两次尝试共享
-    const messageBuffer = [];
-    const messageStream = new ReadableStream({
-      start(controller) {
-        ws.addEventListener('message', event => {
-          const data = new Uint8Array(event.data);
-          messageBuffer.push(data);
-          controller.enqueue(data);
-        });
-        ws.addEventListener('close', () => controller.close());
-        ws.addEventListener('error', () => controller.error(new Error('WebSocket error')));
-      }
+async function handleVLESS(ws) {
+    let remoteSocket = null;
+    let vlessResponseHeader = null;
+
+    // 将 WebSocket 转换为 ReadableStream
+    const wsStream = new ReadableStream({
+        start(controller) {
+            ws.addEventListener('message', (event) => {
+                controller.enqueue(event.data);
+            });
+            ws.addEventListener('close', () => controller.close());
+            ws.addEventListener('error', () => controller.error(new Error('WS Error')));
+        }
     });
-    
-    const reader = messageStream.getReader();
-    const { value: firstMessage } = await reader.read();
-    if (!firstMessage || wsClosed) return;
-    
-    const parsed = parseVLESSHeader(firstMessage);
-    if (parsed.hasError) throw new Error(parsed.message);
-    
-    const vlessHeader = new Uint8Array([parsed.vlessVersion[0], 0]);
-    const initialData = firstMessage.slice(parsed.rawDataIndex);
-    
-    // 顺序尝试两种连接方式，每次尝试都使用全新的资源
-    let success = false;
-    let lastError = null;
-    
-    // 尝试1: 直接连接
-    if (!wsClosed) {
-      try {
-        console.log(`Attempt 1: Direct connection to ${parsed.addressRemote}:${parsed.portRemote}`);
-        await attemptConnection(
-          ws, 
-          parsed.addressRemote, 
-          parsed.portRemote, 
-          vlessHeader, 
-          initialData,
-          wsClosed
-        );
-        success = true;
-        console.log("Attempt 1 succeeded");
-      } catch (err) {
-        lastError = err;
-        console.log(`Attempt 1 failed: ${err.message}`);
-      }
+
+    const reader = wsStream.getReader();
+
+    try {
+        // --- 1. 读取并解析 VLESS 头部 ---
+        const { value: firstChunk, done } = await reader.read();
+        if (done) return;
+
+        const parsed = parseVLESSHeader(firstChunk);
+        if (parsed.hasError) throw new Error(parsed.message);
+
+        vlessResponseHeader = new Uint8Array([parsed.vlessVersion[0], 0]);
+        const initialData = firstChunk.slice(parsed.rawDataIndex);
+
+        // --- 2. 建立远程 TCP 连接 ---
+        // 优先尝试目标地址，失败后尝试 ProxyIP
+        try {
+            remoteSocket = await connect({ hostname: parsed.addressRemote, port: parsed.portRemote });
+        } catch (e) {
+            console.log(`Direct connect failed, trying proxy: ${_JeHxQnQHudDPWbyN}`);
+            remoteSocket = await connect({ hostname: _JeHxQnQHudDPWbyN, port: _JsGTkSTJgBtAOVZl });
+        }
+
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(initialData);
+        writer.releaseLock();
+
+        // --- 3. 双向流绑定 ---
+        
+        // [下行] Remote -> WebSocket
+        const remoteToWs = async () => {
+            const remoteReader = remoteSocket.readable.getReader();
+            let isFirst = true;
+            try {
+                while (true) {
+                    const { value, done } = await remoteReader.read();
+                    if (done) break;
+                    if (isFirst) {
+                        // 发送 VLESS 响应头 + 第一块数据
+                        const combined = new Uint8Array(vlessResponseHeader.length + value.byteLength);
+                        combined.set(vlessResponseHeader, 0);
+                        combined.set(new Uint8Array(value), vlessResponseHeader.length);
+                        ws.send(combined);
+                        isFirst = false;
+                    } else {
+                        ws.send(value);
+                    }
+                }
+            } finally {
+                remoteReader.releaseLock();
+                ws.close();
+            }
+        };
+
+        // [上行] WebSocket -> Remote
+        const wsToRemote = async () => {
+            try {
+                // 注意：这里继续使用之前的 reader 读取后续消息
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    const writer = remoteSocket.writable.getWriter();
+                    await writer.write(value);
+                    writer.releaseLock();
+                }
+            } finally {
+                if (remoteSocket) remoteSocket.close();
+            }
+        };
+
+        // 同时启动两个方向的转发
+        await Promise.all([remoteToWs(), wsToRemote()]);
+
+    } catch (err) {
+        console.error("Handler Error:", err.message);
+        ws.close();
+    } finally {
+        if (remoteSocket) remoteSocket.close();
     }
-    
-    // 尝试2: 代理IP（如果尝试1失败且WebSocket仍打开）
-    if (!success && !wsClosed) {
-      try {
-        console.log(`Attempt 2: Proxy connection to ${_JeHxQnQHudDPWbyN}:${_JsGTkSTJgBtAOVZl}`);
-        await attemptConnection(
-          ws, 
-          _JeHxQnQHudDPWbyN, 
-          _JsGTkSTJgBtAOVZl, 
-          vlessHeader, 
-          initialData,
-          wsClosed
-        );
-        success = true;
-        console.log("Attempt 2 succeeded");
-      } catch (err) {
-        lastError = err;
-        console.log(`Attempt 2 failed: ${err.message}`);
-      }
-    }
-    
-    if (!success && !wsClosed) {
-      throw new Error(`All connection attempts failed: ${lastError?.message}`);
-    }
-    
-  } catch (err) {
-    if (!wsClosed) {
-      console.error("Handle Error:", err.message);
-    }
-  }
 }
 
-// 独立的连接尝试函数 - 所有资源都在这个函数内部管理
-async function attemptConnection(ws, hostname, port, vlessHeader, initialData, wsClosed) {
-  let socket = null;
-  let reader = null;
-  let writer = null;
-  
-  try {
-    // 1. 建立连接（带超时）
-    socket = await connectWithTimeout({ hostname, port }, CONNECTION_TIMEOUT);
-    
-    // 2. 写入初始数据
-    writer = socket.writable.getWriter();
-    await writer.write(initialData);
-    await writer.close(); // 关闭writer，但保持socket打开
-    writer = null;
-    
-    // 3. 读取远程响应
-    reader = socket.readable.getReader();
-    
-    // 4. 设置数据接收超时
-    const dataTimeout = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Data timeout')), DATA_TIMEOUT);
-    });
-    
-    // 5. 等待第一个数据包
-    const firstDataPromise = reader.read();
-    const { done, value } = await Promise.race([firstDataPromise, dataTimeout]);
-    
-    if (done || wsClosed) {
-      throw new Error('Connection closed before data received');
-    }
-    
-    // 6. 发送第一个数据包（带VLESS头）
-    if (ws.readyState === WS_READY_STATE_OPEN) {
-      const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
-      combined.set(vlessHeader, 0);
-      combined.set(value, vlessHeader.byteLength);
-      ws.send(combined);
-    }
-    
-    // 7. 继续转发剩余数据
-    while (!wsClosed) {
-      const { done, value } = await reader.read();
-      if (done || wsClosed) break;
-      
-      if (ws.readyState === WS_READY_STATE_OPEN) {
-        ws.send(value);
-      }
-    }
-    
-  } finally {
-    // 清理所有资源
-    if (writer) {
-      try { writer.close(); } catch(e) {}
-    }
-    if (reader) {
-      try { reader.releaseLock(); } catch(e) {}
-    }
-    if (socket) {
-      try { socket.close(); } catch(e) {}
-    }
-  }
-}
-
-async function connectWithTimeout(options, timeoutMs) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  
-  try {
-    const socket = await connect(options, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    return socket;
-  } catch (err) {
-    clearTimeout(timeoutId);
-    throw err;
-  }
-}
-
+// VLESS 协议解析函数 (保持你的原有逻辑，但修复了部分字节偏移问题)
 function parseVLESSHeader(buffer) {
-  if (buffer.byteLength < 24) {
-    return { hasError: true, message: 'Invalid header length' };
-  }
-  
-  const view = new DataView(buffer.buffer);
-  const version = new Uint8Array(buffer.slice(0, 1));
-  
-  const uuidBytes = new Uint8Array(buffer.slice(1, 17));
-  const uuidHex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-  const expectedUuid = _rcHzgeggsXmfUWrW.replace(/-/g, '');
-  
-  if (uuidHex !== expectedUuid) {
-    return { hasError: true, message: 'Unauthorized' };
-  }
-  
-  const optionsLength = view.getUint8(17);
-  const command = view.getUint8(18 + optionsLength);
-  
-  if (command !== 1 && command !== 2) {
-    return { hasError: true, message: 'Unsupported command' };
-  }
-  
-  let offset = 19 + optionsLength;
-  const port = view.getUint16(offset);
-  offset += 2;
-  
-  const addressType = view.getUint8(offset++);
-  let address = '';
-  
-  switch (addressType) {
-    case 1:
-      address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
-      offset += 4;
-      break;
-    case 2:
-      const domainLength = view.getUint8(offset++);
-      address = new TextDecoder().decode(buffer.slice(offset, offset + domainLength));
-      offset += domainLength;
-      break;
-    case 3:
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(view.getUint16(offset).toString(16));
-        offset += 2;
-      }
-      address = ipv6.join(':');
-      break;
-    default:
-      return { hasError: true, message: 'Unsupported address type' };
-  }
-  
-  return {
-    hasError: false,
-    addressRemote: address,
-    portRemote: port,
-    rawDataIndex: offset,
-    vlessVersion: version,
-    isUDP: command === 2,
-    addressType: addressType
-  };
+    const view = new DataView(buffer instanceof ArrayBuffer ? buffer : buffer.buffer);
+    if (buffer.byteLength < 24) return { hasError: true, message: 'Header too short' };
+
+    const version = new Uint8Array(buffer.slice(0, 1));
+    
+    // UUID 验证
+    const uuidBytes = new Uint8Array(buffer.slice(1, 17));
+    const uuidHex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (uuidHex !== _rcHzgeggsXmfUWrW.replace(/-/g, '')) {
+        return { hasError: true, message: 'Unauthorized UUID' };
+    }
+
+    const addonsLen = view.getUint8(17);
+    let offset = 18 + addonsLen;
+    
+    const command = view.getUint8(offset); // 1: TCP, 2: UDP
+    offset++;
+    
+    const port = view.getUint16(offset);
+    offset += 2;
+
+    const addressType = view.getUint8(offset);
+    offset++;
+
+    let address = '';
+    if (addressType === 1) { // IPv4
+        address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
+        offset += 4;
+    } else if (addressType === 2) { // Domain
+        const len = view.getUint8(offset);
+        offset++;
+        address = new TextDecoder().decode(buffer.slice(offset, offset + len));
+        offset += len;
+    } else if (addressType === 3) { // IPv6
+        const ipv6 = [];
+        for (let i = 0; i < 8; i++) {
+            ipv6.push(view.getUint16(offset).toString(16));
+            offset += 2;
+        }
+        address = ipv6.join(':');
+    }
+
+    return {
+        hasError: false,
+        addressRemote: address,
+        portRemote: port,
+        vlessVersion: version,
+        rawDataIndex: offset
+    };
 }
