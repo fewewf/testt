@@ -5,7 +5,6 @@ const _rcHzgeggsXmfUWrW = '56892533-7dad-324a-b0e8-51040d0d04ad';
 const _JeHxQnQHudDPWbyN = 'ProxyIP.FR.CMLiussss.net';
 const _JsGTkSTJgBtAOVZl = 443;
 
-// 添加常量定义
 const WS_READY_STATE_OPEN = 1;
 
 const _KtFJDaQcgkFDwTLY = (_yRsSyhpBCxFbqNPU, _HpkuToMJSAvwPNva = 404) => {
@@ -53,7 +52,6 @@ export default {
     const [_cIMstliQdZbHDVpr, _zNeFASTClFTonTIr] = Object.values(_sdTNvSnQHgfISqwc);
     _zNeFASTClFTonTIr.accept();
     
-    // 不等待，避免阻塞
     _QlxgSaLbCagSZvDa(_zNeFASTClFTonTIr).catch(_wozDXumapohYMyrU => {
       console.error("Critical WS Error:", _wozDXumapohYMyrU.message);
       try { _zNeFASTClFTonTIr.close(); } catch(e) {}
@@ -73,177 +71,180 @@ export default {
 
 async function _QlxgSaLbCagSZvDa(_zNeFASTClFTonTIr) {
   const _rQBZEdhdojOaQypG = _GWHvqQvdiYQMUGEh(_zNeFASTClFTonTIr);
-  let _jJUejlszoJxKpVyr = null;
-  let _VMwvXLIMJYZDGMLS = null;
-  let _IxamNRThaYlJuRBk = null;
+  let _activeSocket = null;
+  let _vlessHeader = null;
+  let _initialData = null;
   let _useProxyIP = false;
   let _isFallbackInProgress = false;
   let _webSocketClosed = false;
   
-  const _mbaxDGhgHkhYiXMf = _rQBZEdhdojOaQypG.getReader();
+  const _clientReader = _rQBZEdhdojOaQypG.getReader();
+  let _clientWriterLock = null;
   
-  // 监听WebSocket关闭事件
   _zNeFASTClFTonTIr.addEventListener('close', () => {
     _webSocketClosed = true;
   });
   
   try {
-    const {
-      done: _ViOGcMXtboZDHxcp,
-      value: _xfAKCMFjFRznTnje
-    } = await _mbaxDGhgHkhYiXMf.read();
+    // 读取第一个消息（VLESS头）
+    const { done: firstDone, value: firstMessage } = await _clientReader.read();
+    if (firstDone || _webSocketClosed) return;
     
-    if (_ViOGcMXtboZDHxcp || _webSocketClosed) return;
+    const parsedHeader = _MkxTgzbSwfhpsfJi(firstMessage);
+    if (parsedHeader.hasError) throw new Error(parsedHeader.message);
     
-    const _TyFwoqvKDFIbgSAh = _MkxTgzbSwfhpsfJi(_xfAKCMFjFRznTnje);
-    if (_TyFwoqvKDFIbgSAh.hasError) throw new Error(_TyFwoqvKDFIbgSAh.message);
+    _vlessHeader = new Uint8Array([parsedHeader.vlessVersion[0], 0]);
+    _initialData = firstMessage.slice(parsedHeader.rawDataIndex);
     
-    _VMwvXLIMJYZDGMLS = new Uint8Array([_TyFwoqvKDFIbgSAh.vlessVersion[0], 0]);
-    _IxamNRThaYlJuRBk = _xfAKCMFjFRznTnje.slice(_TyFwoqvKDFIbgSAh.rawDataIndex);
-    
-    // 定义连接函数
-    async function createConnection(useProxy = false) {
-      if (useProxy) {
-        return await connect({
-          hostname: _JeHxQnQHudDPWbyN,
-          port: _JsGTkSTJgBtAOVZl
-        });
-      } else {
-        return await connect({
-          hostname: _TyFwoqvKDFIbgSAh.addressRemote,
-          port: _TyFwoqvKDFIbgSAh.portRemote
-        });
-      }
-    }
-    
-    // 先尝试直接连接
+    // 尝试直接连接
     try {
-      _jJUejlszoJxKpVyr = await createConnection(false);
-      const writer = _jJUejlszoJxKpVyr.writable.getWriter();
-      await writer.write(_IxamNRThaYlJuRBk);
+      _activeSocket = await connect({
+        hostname: parsedHeader.addressRemote,
+        port: parsedHeader.portRemote
+      });
+      const writer = _activeSocket.writable.getWriter();
+      await writer.write(_initialData);
       writer.releaseLock();
     } catch (err) {
       console.log("Direct connection failed, using proxy IP:", err.message);
-      _jJUejlszoJxKpVyr = await createConnection(true);
-      const writer = _jJUejlszoJxKpVyr.writable.getWriter();
-      await writer.write(_IxamNRThaYlJuRBk);
+      _activeSocket = await connect({
+        hostname: _JeHxQnQHudDPWbyN,
+        port: _JsGTkSTJgBtAOVZl
+      });
+      const writer = _activeSocket.writable.getWriter();
+      await writer.write(_initialData);
       writer.releaseLock();
       _useProxyIP = true;
     }
     
-    // 创建两个方向的流
-    const [clientToRemotePromise, remoteToClientPromise] = await Promise.all([
-      // 客户端 -> 远程
-      (async () => {
-        const writer = _jJUejlszoJxKpVyr.writable.getWriter();
-        try {
-          while (!_webSocketClosed) {
-            const { done, value } = await _mbaxDGhgHkhYiXMf.read();
-            if (done || _webSocketClosed) break;
-            await writer.write(value);
-          }
-        } finally {
-          writer.releaseLock();
+    // 创建取消控制器
+    const controller = new AbortController();
+    
+    // 客户端 -> 远程流
+    const clientToRemote = (async () => {
+      const writer = _activeSocket.writable.getWriter();
+      _clientWriterLock = writer;
+      try {
+        while (!_webSocketClosed && !controller.signal.aborted) {
+          const { done, value } = await _clientReader.read();
+          if (done || _webSocketClosed || controller.signal.aborted) break;
+          await writer.write(value);
         }
-      })(),
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          console.error("Client to remote error:", err.message);
+        }
+      } finally {
+        writer.releaseLock();
+        _clientWriterLock = null;
+      }
+    })();
+    
+    // 远程 -> 客户端流（带回退逻辑）
+    const remoteToClient = (async () => {
+      const reader = _activeSocket.readable.getReader();
+      let headerSent = false;
+      let hasData = false;
       
-      // 远程 -> 客户端
-      (async () => {
-        const reader = _jJUejlszoJxKpVyr.readable.getReader();
-        let headerSent = false;
-        let hasData = false;
-        
-        try {
-          while (!_webSocketClosed) {
-            const { done, value } = await reader.read();
-            if (done || _webSocketClosed) break;
-            
-            hasData = true;
-            
-            if (_zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
-              if (!headerSent) {
-                const combined = new Uint8Array(_VMwvXLIMJYZDGMLS.byteLength + value.byteLength);
-                combined.set(_VMwvXLIMJYZDGMLS, 0);
-                combined.set(value, _VMwvXLIMJYZDGMLS.byteLength);
-                _zNeFASTClFTonTIr.send(combined);
-                headerSent = true;
-              } else {
-                _zNeFASTClFTonTIr.send(value);
-              }
+      try {
+        while (!_webSocketClosed && !controller.signal.aborted) {
+          const { done, value } = await reader.read();
+          if (done || _webSocketClosed || controller.signal.aborted) break;
+          
+          hasData = true;
+          
+          if (_zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
+            if (!headerSent) {
+              const combined = new Uint8Array(_vlessHeader.byteLength + value.byteLength);
+              combined.set(_vlessHeader, 0);
+              combined.set(value, _vlessHeader.byteLength);
+              _zNeFASTClFTonTIr.send(combined);
+              headerSent = true;
+            } else {
+              _zNeFASTClFTonTIr.send(value);
             }
           }
-        } finally {
-          reader.releaseLock();
+        }
+      } finally {
+        reader.releaseLock();
+        
+        // 如果没有数据且需要回退
+        if (!hasData && !_useProxyIP && !_webSocketClosed && !_isFallbackInProgress) {
+          _isFallbackInProgress = true;
+          console.log("No data received, attempting fallback to proxy IP...");
           
-          // 如果没有收到任何数据且不是代理IP模式，尝试回退
-          if (!hasData && !_useProxyIP && !_webSocketClosed && !_isFallbackInProgress) {
-            _isFallbackInProgress = true;
-            console.log("No data received, attempting fallback to proxy IP...");
+          // 1. 先取消当前所有操作
+          controller.abort();
+          
+          // 2. 关闭旧socket
+          if (_activeSocket) {
+            try { _activeSocket.close(); } catch(e) {}
+          }
+          
+          // 3. 取消客户端读取
+          if (_clientWriterLock) {
+            try { _clientWriterLock.releaseLock(); } catch(e) {}
+          }
+          
+          try {
+            // 4. 创建新连接
+            const newSocket = await connect({
+              hostname: _JeHxQnQHudDPWbyN,
+              port: _JsGTkSTJgBtAOVZl
+            });
             
-            try {
-              // 关闭旧连接
-              if (_jJUejlszoJxKpVyr) {
-                try { _jJUejlszoJxKpVyr.close(); } catch(e) {}
-              }
+            // 5. 写入初始数据
+            const newWriter = newSocket.writable.getWriter();
+            await newWriter.write(_initialData);
+            newWriter.releaseLock();
+            
+            _activeSocket = newSocket;
+            _useProxyIP = true;
+            _isFallbackInProgress = false;
+            
+            // 6. 重新建立远程到客户端流
+            const newReader = newSocket.readable.getReader();
+            let newHeaderSent = false;
+            
+            while (!_webSocketClosed) {
+              const { done, value } = await newReader.read();
+              if (done || _webSocketClosed) break;
               
-              // 创建新连接（使用代理IP）
-              const newSocket = await connect({
-                hostname: _JeHxQnQHudDPWbyN,
-                port: _JsGTkSTJgBtAOVZl
-              });
-              
-              // 写入初始数据
-              const newWriter = newSocket.writable.getWriter();
-              await newWriter.write(_IxamNRThaYlJuRBk);
-              newWriter.releaseLock();
-              
-              _useProxyIP = true;
-              
-              // 重新建立从远程到客户端的流
-              const newReader = newSocket.readable.getReader();
-              let newHeaderSent = false;
-              
-              while (!_webSocketClosed) {
-                const { done, value } = await newReader.read();
-                if (done || _webSocketClosed) break;
-                
-                if (_zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
-                  if (!newHeaderSent) {
-                    const combined = new Uint8Array(_VMwvXLIMJYZDGMLS.byteLength + value.byteLength);
-                    combined.set(_VMwvXLIMJYZDGMLS, 0);
-                    combined.set(value, _VMwvXLIMJYZDGMLS.byteLength);
-                    _zNeFASTClFTonTIr.send(combined);
-                    newHeaderSent = true;
-                  } else {
-                    _zNeFASTClFTonTIr.send(value);
-                  }
+              if (_zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
+                if (!newHeaderSent) {
+                  const combined = new Uint8Array(_vlessHeader.byteLength + value.byteLength);
+                  combined.set(_vlessHeader, 0);
+                  combined.set(value, _vlessHeader.byteLength);
+                  _zNeFASTClFTonTIr.send(combined);
+                  newHeaderSent = true;
+                } else {
+                  _zNeFASTClFTonTIr.send(value);
                 }
               }
-              
-              newReader.releaseLock();
-              
-            } catch (fallbackErr) {
-              console.error("Fallback failed:", fallbackErr);
-              if (_zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
-                _zNeFASTClFTonTIr.close(1011, "Fallback failed");
-              }
+            }
+            
+            newReader.releaseLock();
+            
+          } catch (fallbackErr) {
+            console.error("Fallback failed:", fallbackErr);
+            if (_zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
+              _zNeFASTClFTonTIr.close(1011, "Fallback failed");
             }
           }
         }
-      })()
-    ]);
+      }
+    })();
     
-    // 等待任意一个流结束
-    await Promise.race([clientToRemotePromise, remoteToClientPromise]);
+    await Promise.race([clientToRemote, remoteToClient]);
     
   } catch (_wozDXumapohYMyrU) {
-    if (!_webSocketClosed) {
+    if (!_webSocketClosed && !_isFallbackInProgress) {
       console.error("HandleWS Error:", _wozDXumapohYMyrU.message);
     }
   } finally {
-    _mbaxDGhgHkhYiXMf.releaseLock();
-    if (_jJUejlszoJxKpVyr) {
-      try { _jJUejlszoJxKpVyr.close(); } catch {}
+    _clientReader.releaseLock();
+    if (_activeSocket) {
+      try { _activeSocket.close(); } catch {}
     }
     if (!_webSocketClosed && _zNeFASTClFTonTIr.readyState === WS_READY_STATE_OPEN) {
       try { _zNeFASTClFTonTIr.close(); } catch {}
