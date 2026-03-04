@@ -166,7 +166,7 @@ function _MkxTgzbSwfhpsfJi(_QjfgPTDmcvdvEOSN) {
   };
   const _igZwspOTXOUDIgpJ = new DataView(_QjfgPTDmcvdvEOSN.buffer);
   const _mQuBmCqLfAfNDGqA = Array.from(new Uint8Array(_QjfgPTDmcvdvEOSN.slice(1, 17))).map(_UgvgeNOVlJZSBxZG => _UgvgeNOVlJZSBxZG.toString(16).padStart(2, '0')).join('');
-  if (_mQuBmCqLfAfNDGqA !== FIXED_UUID.replace(/-/g, '')) return {
+  if (_mQuBmCqLfAfNDGqA !== _rcHzgeggsXmfUWrW.replace(/-/g, '')) return {
     hasError: true,
     message: 'Unauthorized'
   };
