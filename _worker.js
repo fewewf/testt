@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets';
 
 const _cQndIdPFBwdwdfPS = '/t-vip-9026/auth-888999';
 const _rcHzgeggsXmfUWrW = '56892533-7dad-324a-b0e8-51040d0d04ad';
-const _JeHxQnQHudDPWbyN = 'yx1.98981.xyz'; 
+const _JeHxQnQHudDPWbyN = 'yx1.9898981.xyz'; 
 const _JsGTkSTJgBtAOVZl = 8443;
 
 export default {
