@@ -6,7 +6,8 @@ const _JeHxQnQHudDPWbyN = 'ProxyIP.FR.CMLiussss.net';
 const _JsGTkSTJgBtAOVZl = 443;
 
 const WS_READY_STATE_OPEN = 1;
-const CONNECTION_TIMEOUT = 5000;
+const CONNECTION_TIMEOUT = 5000; // 5秒超时
+const DATA_TIMEOUT = 3000; // 3秒数据超时
 
 const _KtFJDaQcgkFDwTLY = (_yRsSyhpBCxFbqNPU, _HpkuToMJSAvwPNva = 404) => {
   const _XwbeLFBOTVlfgfaV = {
@@ -54,6 +55,7 @@ export default {
     const [_cIMstliQdZbHDVpr, _zNeFASTClFTonTIr] = Object.values(_sdTNvSnQHgfISqwc);
     _zNeFASTClFTonTIr.accept();
     
+    // 启动处理，但不等待
     handleWebSocket(_zNeFASTClFTonTIr).catch(err => {
       console.error("WebSocket Error:", err.message);
       try { _zNeFASTClFTonTIr.close(); } catch(e) {}
@@ -72,7 +74,6 @@ export default {
 };
 
 async function handleWebSocket(ws) {
-  let targetSocket = null;
   let wsClosed = false;
   
   ws.addEventListener('close', () => { wsClosed = true; });
@@ -81,132 +82,150 @@ async function handleWebSocket(ws) {
   try {
     const wsReader = createWebSocketReader(ws).getReader();
     
+    // 读取第一个消息（VLESS头）
     const { value: firstMessage } = await wsReader.read();
     if (!firstMessage || wsClosed) return;
     
-    // 使用修复后的解析函数
     const parsed = parseVLESSHeader(firstMessage);
     if (parsed.hasError) throw new Error(parsed.message);
     
     const vlessHeader = new Uint8Array([parsed.vlessVersion[0], 0]);
     const initialData = firstMessage.slice(parsed.rawDataIndex);
     
-    // 先尝试直接连接
-    let useProxy = false;
+    // 顺序尝试两种连接方式
+    let success = false;
+    let lastError = null;
+    
+    // 尝试1: 直接连接
     try {
-      console.log(`Attempting direct connection to ${parsed.addressRemote}:${parsed.portRemote}`);
-      targetSocket = await connectWithTimeout({
+      console.log(`Attempt 1: Direct connection to ${parsed.addressRemote}:${parsed.portRemote}`);
+      await tryConnection(ws, wsReader, {
         hostname: parsed.addressRemote,
         port: parsed.portRemote
-      }, CONNECTION_TIMEOUT);
+      }, vlessHeader, initialData, wsClosed);
+      success = true;
     } catch (err) {
-      console.log(`Direct connection failed, falling back to proxy IP`);
-      useProxy = true;
-      targetSocket = await connectWithTimeout({
-        hostname: _JeHxQnQHudDPWbyN,
-        port: _JsGTkSTJgBtAOVZl
-      }, CONNECTION_TIMEOUT);
+      lastError = err;
+      console.log(`Attempt 1 failed: ${err.message}`);
     }
     
-    const writer = targetSocket.writable.getWriter();
-    await writer.write(initialData);
-    writer.releaseLock();
+    // 如果直接连接失败或超时，尝试代理IP
+    if (!success && !wsClosed) {
+      try {
+        console.log(`Attempt 2: Proxy connection to ${_JeHxQnQHudDPWbyN}:${_JsGTkSTJgBtAOVZl}`);
+        await tryConnection(ws, wsReader, {
+          hostname: _JeHxQnQHudDPWbyN,
+          port: _JsGTkSTJgBtAOVZl
+        }, vlessHeader, initialData, wsClosed);
+        success = true;
+      } catch (err) {
+        lastError = err;
+        console.log(`Attempt 2 failed: ${err.message}`);
+      }
+    }
     
-    // 双向数据流转发
-    await Promise.race([
-      // 客户端 -> 远程
-      (async () => {
-        const w = targetSocket.writable.getWriter();
-        try {
-          while (!wsClosed) {
-            const { done, value } = await wsReader.read();
-            if (done || wsClosed) break;
-            await w.write(value);
-          }
-        } finally {
-          w.releaseLock();
-        }
-      })(),
-      
-      // 远程 -> 客户端
-      (async () => {
-        const r = targetSocket.readable.getReader();
-        let headerSent = false;
-        let dataReceived = false;
-        
-        try {
-          while (!wsClosed) {
-            const { done, value } = await r.read();
-            if (done || wsClosed) break;
-            
-            dataReceived = true;
-            
-            if (ws.readyState === WS_READY_STATE_OPEN) {
-              if (!headerSent) {
-                const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
-                combined.set(vlessHeader, 0);
-                combined.set(value, vlessHeader.byteLength);
-                ws.send(combined);
-                headerSent = true;
-              } else {
-                ws.send(value);
-              }
-            }
-          }
-        } catch (err) {
-          // 如果没有收到数据且还没用过代理IP，尝试重试
-          if (!dataReceived && !useProxy && !wsClosed) {
-            console.log("No data received, retrying with proxy IP...");
-            
-            try { targetSocket.close(); } catch(e) {}
-            
-            const retrySocket = await connectWithTimeout({
-              hostname: _JeHxQnQHudDPWbyN,
-              port: _JsGTkSTJgBtAOVZl
-            }, CONNECTION_TIMEOUT);
-            
-            const retryWriter = retrySocket.writable.getWriter();
-            await retryWriter.write(initialData);
-            retryWriter.releaseLock();
-            
-            const retryReader = retrySocket.readable.getReader();
-            let retryHeaderSent = false;
-            
-            while (!wsClosed) {
-              const { done, value } = await retryReader.read();
-              if (done || wsClosed) break;
-              
-              if (ws.readyState === WS_READY_STATE_OPEN) {
-                if (!retryHeaderSent) {
-                  const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
-                  combined.set(vlessHeader, 0);
-                  combined.set(value, vlessHeader.byteLength);
-                  ws.send(combined);
-                  retryHeaderSent = true;
-                } else {
-                  ws.send(value);
-                }
-              }
-            }
-            
-            retryReader.releaseLock();
-          }
-        } finally {
-          r.releaseLock();
-        }
-      })()
-    ]);
+    if (!success) {
+      throw new Error(`All connection attempts failed: ${lastError?.message}`);
+    }
     
   } catch (err) {
     if (!wsClosed) {
       console.error("Handle Error:", err.message);
     }
   } finally {
-    if (targetSocket) {
-      try { targetSocket.close(); } catch(e) {}
-    }
     if (!wsClosed && ws.readyState === WS_READY_STATE_OPEN) {
       try { ws.close(); } catch(e) {}
+    }
+  }
+}
+
+// 尝试一次完整的连接和数据传输
+async function tryConnection(ws, wsReader, target, vlessHeader, initialData, wsClosed) {
+  let socket = null;
+  
+  try {
+    // 1. 建立连接（带超时）
+    socket = await connectWithTimeout(target, CONNECTION_TIMEOUT);
+    
+    // 2. 写入初始数据
+    const writer = socket.writable.getWriter();
+    await writer.write(initialData);
+    writer.releaseLock();
+    
+    // 3. 等待第一份数据返回（带超时）
+    const reader = socket.readable.getReader();
+    let headerSent = false;
+    
+    // 设置数据接收超时
+    const dataTimeout = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Data timeout')), DATA_TIMEOUT);
+    });
+    
+    try {
+      // 等待第一个数据包
+      const firstDataPromise = reader.read();
+      const { done, value } = await Promise.race([firstDataPromise, dataTimeout]);
+      
+      if (done || wsClosed) return;
+      
+      // 发送第一个数据包（带VLESS头）
+      if (ws.readyState === WS_READY_STATE_OPEN) {
+        const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
+        combined.set(vlessHeader, 0);
+        combined.set(value, vlessHeader.byteLength);
+        ws.send(combined);
+        headerSent = true;
+      }
+      
+      // 4. 建立双向数据流
+      await Promise.race([
+        // 客户端 -> 远程
+        (async () => {
+          const w = socket.writable.getWriter();
+          try {
+            while (!wsClosed) {
+              const { done, value } = await wsReader.read();
+              if (done || wsClosed) break;
+              await w.write(value);
+            }
+          } finally {
+            w.releaseLock();
+          }
+        })(),
+        
+        // 远程 -> 客户端
+        (async () => {
+          const r = reader; // 复用已有的reader
+          try {
+            while (!wsClosed) {
+              const { done, value } = await r.read();
+              if (done || wsClosed) break;
+              
+              if (ws.readyState === WS_READY_STATE_OPEN) {
+                if (!headerSent) {
+                  const combined = new Uint8Array(vlessHeader.byteLength + value.byteLength);
+                  combined.set(vlessHeader, 0);
+                  combined.set(value, vlessHeader.byteLength);
+                  ws.send(combined);
+                  headerSent = true;
+                } else {
+                  ws.send(value);
+                }
+              }
+            }
+          } finally {
+            r.releaseLock();
+          }
+        })()
+      ]);
+      
+    } finally {
+      reader.releaseLock();
+    }
+    
+  } finally {
+    if (socket) {
+      try { socket.close(); } catch(e) {}
     }
   }
 }
@@ -237,7 +256,6 @@ function createWebSocketReader(ws) {
   });
 }
 
-// 修复后的VLESS头解析函数 - 基于第二段代码
 function parseVLESSHeader(buffer) {
   if (buffer.byteLength < 24) {
     return { hasError: true, message: 'Invalid header length' };
@@ -258,7 +276,6 @@ function parseVLESSHeader(buffer) {
   const optionsLength = view.getUint8(17);
   const command = view.getUint8(18 + optionsLength);
   
-  // 检查命令类型（TCP=1, UDP=2）
   if (command !== 1 && command !== 2) {
     return { hasError: true, message: 'Unsupported command' };
   }
